@@ -31,7 +31,7 @@ def keep_alive():
 intents = discord.Intents.default()
 intents.message_content = True  # needed if you want commands to work later
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="-", intents=intents)
 
 
 @bot.event
@@ -46,7 +46,7 @@ async def on_ready():
 # Example command so you know it's alive - try "!ping" in your server
 @bot.command()
 async def ping(ctx):
-    await ctx.send("Cunt")
+    await ctx.send("cunt")
 
 
 # Roast command - usage: !roast @someone
@@ -80,7 +80,7 @@ async def roast(ctx, member: discord.Member = None):
         await ctx.send(f"{member.mention} {roast_text}")
     except Exception as e:
         print(f"Roast command error: {e}")
-        await ctx.send("No sry ask daddy jay for help")
+        await ctx.send("no sry ask daddy jay for help")
 
 
 keep_alive()
