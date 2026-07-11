@@ -56,8 +56,8 @@ async def roast(ctx, member: discord.Member = None):
     await ctx.typing()
 
     prompt = (
-     f"Write a short, savage roast (1-3 sentences) for {member.display_name}. "
-f"Be extremely rude, mean, and brutal. Use curse words. Roast their fat ass, ugly face, stupid personality, smell, laziness — go hard. "
+     f"Write a short, savage roast (1-2 sentences) for {member.display_name}. "
+f"Be extremely rude, mean, and brutal. Be creative, not traditional. Use curse words. Roast their fat ass, ugly face, stupid personality, smell, laziness — go hard. "
 f"Make it funny and vicious. "
 f"Absolutely no race, ethnicity, sexuality, or homophobic shit."
     )
