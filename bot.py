@@ -56,9 +56,10 @@ async def roast(ctx, member: discord.Member = None):
     await ctx.typing()
 
     prompt = (
-        f"Write a short, playful, PG-13 roast (2-3 sentences) of someone named "
-        f"{member.display_name}. Keep it funny and lighthearted, not genuinely mean "
-        f"or based on real personal info - just silly banter between friends."
+       f"Roast the absolute shit out of {member.display_name} in 2-4 sentences. Be ruthless, cruel, and hilarious. "
+f"Go hard on their looks, weight, smell, stupidity, laziness, or anything else that makes them roastable. "
+f"Fat jokes and brutal burns are 100% allowed and encouraged. "
+f"Never mention race, sexuality, or anything homophobic."
     )
 
     try:
