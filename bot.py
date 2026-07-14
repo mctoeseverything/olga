@@ -17,6 +17,7 @@ NOTIFY_CHANNEL_ID = 1513932318119825548  # Discord channel ID to post notificati
 # ---- Config ----
 TOKEN = os.getenv("DISCORD_TOKEN")  # set this as an environment variable, don't paste your token here
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # get this free from console.groq.com
+ROBLOX_COOKIE = os.getenv("ROBLOX_COOKIE")  # .ROBLOSECURITY cookie value, see setup notes
 STATUS_TEXT = "Olga Family: Season 3.5"  # change this to whatever you want
 
 # Only these Discord user IDs can use -send - this command can post as your
@@ -218,6 +219,16 @@ async def refresh_tracked_users():
     print(f"[tracker] Refreshed tracked list: {len(tracked_user_ids)} user(s) found for role(s) {TRACKED_ROLE_IDS}")
 
 
+async def get_csrf_token(session):
+    """Roblox requires an X-CSRF-TOKEN header for authenticated POST requests.
+    It's handed back in the response headers of a deliberately-failed request."""
+    async with session.post(
+        "https://auth.roblox.com/v2/logout",
+        headers={"Cookie": f".ROBLOSECURITY={ROBLOX_COOKIE}"},
+    ) as resp:
+        return resp.headers.get("x-csrf-token")
+
+
 async def check_presence():
     """Check presence for all tracked users and notify on new joins to the target game."""
     global last_in_game
@@ -225,10 +236,22 @@ async def check_presence():
         print(f"[tracker] Skipping check - tracked_user_ids={len(tracked_user_ids)}, TARGET_PLACE_ID={TARGET_PLACE_ID}, NOTIFY_CHANNEL_ID={NOTIFY_CHANNEL_ID}")
         return
 
+    headers = {}
+    if ROBLOX_COOKIE:
+        headers["Cookie"] = f".ROBLOSECURITY={ROBLOX_COOKIE}"
+
     async with aiohttp.ClientSession() as session:
+        if ROBLOX_COOKIE:
+            csrf = await get_csrf_token(session)
+            if csrf:
+                headers["X-CSRF-TOKEN"] = csrf
+            else:
+                print("[tracker] Could not get CSRF token - cookie may be invalid/expired")
+
         async with session.post(
             "https://presence.roblox.com/v1/presence/users",
             json={"userIds": list(tracked_user_ids)},
+            headers=headers,
         ) as resp:
             if resp.status != 200:
                 print(f"[tracker] Presence check failed: {resp.status}")
