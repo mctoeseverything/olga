@@ -10,7 +10,7 @@ from discord.ext import tasks
 
 # ---- Group rank presence tracker config ----
 GROUP_ID = 32860910  # your Roblox group ID
-TRACKED_ROLE_IDS = [22]  # role IDs to watch - fill these in, see setup notes
+TRACKED_ROLE_IDS = [22]  # role IDs to watch
 TARGET_PLACE_ID = 17333697975  # the specific game's place ID to watch for
 NOTIFY_CHANNEL_ID = 1513932318119825548  # Discord channel ID to post notifications in
 
@@ -206,7 +206,7 @@ async def refresh_tracked_users():
                 url = f"https://groups.roblox.com/v1/groups/{GROUP_ID}/roles/{role_id}/users?limit=100&cursor={cursor}"
                 async with session.get(url) as resp:
                     if resp.status != 200:
-                        print(f"Failed to fetch role {role_id}: {resp.status}")
+                        print(f"[tracker] Failed to fetch role {role_id}: {resp.status}")
                         break
                     data = await resp.json()
                     for user in data.get("data", []):
@@ -215,12 +215,14 @@ async def refresh_tracked_users():
                     if not cursor:
                         break
     tracked_user_ids = ids
+    print(f"[tracker] Refreshed tracked list: {len(tracked_user_ids)} user(s) found for role(s) {TRACKED_ROLE_IDS}")
 
 
 async def check_presence():
     """Check presence for all tracked users and notify on new joins to the target game."""
     global last_in_game
     if not tracked_user_ids or TARGET_PLACE_ID is None or NOTIFY_CHANNEL_ID is None:
+        print(f"[tracker] Skipping check - tracked_user_ids={len(tracked_user_ids)}, TARGET_PLACE_ID={TARGET_PLACE_ID}, NOTIFY_CHANNEL_ID={NOTIFY_CHANNEL_ID}")
         return
 
     async with aiohttp.ClientSession() as session:
@@ -229,24 +231,33 @@ async def check_presence():
             json={"userIds": list(tracked_user_ids)},
         ) as resp:
             if resp.status != 200:
-                print(f"Presence check failed: {resp.status}")
+                print(f"[tracker] Presence check failed: {resp.status}")
                 return
             data = await resp.json()
 
     currently_in_game = set()
     for entry in data.get("userPresences", []):
-        # userPresenceType 2 = InGame
-        if entry.get("userPresenceType") == 2 and entry.get("placeId") == TARGET_PLACE_ID:
+        # userPresenceType 2 = InGame. Check both placeId and rootPlaceId,
+        # since some experiences route joins through a different place ID
+        # than the one shown in the URL (e.g. multi-place games).
+        if entry.get("userPresenceType") == 2 and (
+            entry.get("placeId") == TARGET_PLACE_ID or entry.get("rootPlaceId") == TARGET_PLACE_ID
+        ):
             currently_in_game.add(entry["userId"])
+
+    print(f"[tracker] Checked {len(tracked_user_ids)} user(s), {len(currently_in_game)} currently in target game")
 
     new_joins = currently_in_game - last_in_game
     last_in_game = currently_in_game
 
     if new_joins:
+        print(f"[tracker] {len(new_joins)} new join(s) detected, sending notification")
         channel = bot.get_channel(NOTIFY_CHANNEL_ID)
         if channel:
             for _ in new_joins:
                 await channel.send("Someone on the watchlist just joined the game.")
+        else:
+            print(f"[tracker] Could not find channel with ID {NOTIFY_CHANNEL_ID}")
 
 
 @tasks.loop(seconds=60)
