@@ -10,7 +10,7 @@ from discord.ext import tasks
 
 # ---- Group rank presence tracker config ----
 GROUP_ID = 32860910  # your Roblox group ID
-TRACKED_ROLE_IDS = [22]  # role IDs to watch
+TRACKED_ROLE_IDS = [100231905]  # role IDs to watch
 TARGET_PLACE_ID = 17333697975  # the specific game's place ID to watch for
 NOTIFY_CHANNEL_ID = 1513932318119825548  # Discord channel ID to post notifications in
 
