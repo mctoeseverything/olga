@@ -5,6 +5,7 @@ import threading
 import requests
 import json
 import aiohttp
+import motor.motor_asyncio
 from flask import Flask
 from discord.ext import tasks
 
@@ -18,12 +19,24 @@ NOTIFY_CHANNEL_ID = 1513932318119825548  # Discord channel ID to post notificati
 TOKEN = os.getenv("DISCORD_TOKEN")  # set this as an environment variable, don't paste your token here
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # get this free from console.groq.com
 ROBLOX_COOKIE = os.getenv("ROBLOX_COOKIE")  # .ROBLOSECURITY cookie value, see setup notes
+MONGODB_URI = os.getenv("MONGODB_URI")  # e.g. mongodb+srv://user:pass@cluster.mongodb.net
 STATUS_TEXT = "Olga Family: Season 4"  # change this to whatever you want
+
+# Discord channel to post server member join/leave messages in
+WELCOME_CHANNEL_ID = 1513932506603458580  # change this if you want a different channel
 
 # Only these Discord user IDs can use -send - this command can post as your
 # bot to ANY channel it has access to, so keep this locked down to just you.
 # Right-click your name in Discord (with Developer Mode on) -> Copy User ID
 ADMIN_IDS = [925226542571855943]  # replace with your actual Discord user ID
+
+# ---- MongoDB setup ----
+# Used to persist tracker state (tracked user IDs + who's currently in-game)
+# across restarts/redeploys, so we don't lose state or send spurious
+# "just joined" notifications when the bot comes back up.
+mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI) if MONGODB_URI else None
+db = mongo_client["olgabot"] if mongo_client else None
+state_collection = db["tracker_state"] if db is not None else None
 
 # ---- Keep-alive web server ----
 # Render needs an open port to consider the service "alive", and a free
@@ -45,6 +58,7 @@ def keep_alive():
 
 intents = discord.Intents.default()
 intents.message_content = True  # needed if you want commands to work later
+intents.members = True  # required for on_member_join / on_member_remove to fire
 
 bot = commands.Bot(command_prefix="-", intents=intents)
 
@@ -56,6 +70,25 @@ async def on_ready():
         activity=discord.Activity(type=discord.ActivityType.watching, name=STATUS_TEXT),
         status=discord.Status.online
     )
+
+
+# ---- Server join/leave messages ----
+@bot.event
+async def on_member_join(member):
+    channel = bot.get_channel(WELCOME_CHANNEL_ID)
+    if channel:
+        await channel.send(f"welcome to the server {member.mention}, glad you're here")
+    else:
+        print(f"[welcome] Could not find channel with ID {WELCOME_CHANNEL_ID}")
+
+
+@bot.event
+async def on_member_remove(member):
+    channel = bot.get_channel(WELCOME_CHANNEL_ID)
+    if channel:
+        await channel.send(f"{member.display_name} left the server")
+    else:
+        print(f"[welcome] Could not find channel with ID {WELCOME_CHANNEL_ID}")
 
 
 # Example command so you know it's alive - try "!ping" in your server
@@ -196,6 +229,43 @@ tracked_user_ids = set()
 last_in_game = set()  # user IDs we last saw in the target game
 
 
+async def load_state():
+    """Load tracked_user_ids and last_in_game from MongoDB on startup.
+    Keeps state across restarts/redeploys so we don't lose the tracked
+    list or send spurious join notifications when the bot comes back up."""
+    global tracked_user_ids, last_in_game
+    if state_collection is None:
+        print("[tracker] MONGODB_URI not set, skipping state load (using in-memory only)")
+        return
+    try:
+        doc = await state_collection.find_one({"_id": "tracker"})
+        if doc:
+            tracked_user_ids = set(doc.get("tracked_user_ids", []))
+            last_in_game = set(doc.get("last_in_game", []))
+            print(f"[tracker] Loaded state from MongoDB: {len(tracked_user_ids)} tracked, {len(last_in_game)} in-game")
+        else:
+            print("[tracker] No existing state found in MongoDB")
+    except Exception as e:
+        print(f"[tracker] Failed to load state from MongoDB: {type(e).__name__}: {e}")
+
+
+async def save_state():
+    """Persist tracked_user_ids and last_in_game to MongoDB."""
+    if state_collection is None:
+        return
+    try:
+        await state_collection.update_one(
+            {"_id": "tracker"},
+            {"$set": {
+                "tracked_user_ids": list(tracked_user_ids),
+                "last_in_game": list(last_in_game),
+            }},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[tracker] Failed to save state to MongoDB: {type(e).__name__}: {e}")
+
+
 async def refresh_tracked_users():
     """Pull user IDs for the tracked role(s) from Roblox's public group API."""
     global tracked_user_ids
@@ -217,6 +287,7 @@ async def refresh_tracked_users():
                         break
     tracked_user_ids = ids
     print(f"[tracker] Refreshed tracked list: {len(tracked_user_ids)} user(s) found for role(s) {TRACKED_ROLE_IDS}")
+    await save_state()
 
 
 async def get_csrf_token(session):
@@ -230,7 +301,7 @@ async def get_csrf_token(session):
 
 
 async def check_presence():
-    """Check presence for all tracked users and notify on new joins to the target game."""
+    """Check presence for all tracked users and notify on new joins/leaves for the target game."""
     global last_in_game
     if not tracked_user_ids or TARGET_PLACE_ID is None or NOTIFY_CHANNEL_ID is None:
         print(f"[tracker] Skipping check - tracked_user_ids={len(tracked_user_ids)}, TARGET_PLACE_ID={TARGET_PLACE_ID}, NOTIFY_CHANNEL_ID={NOTIFY_CHANNEL_ID}")
@@ -271,16 +342,29 @@ async def check_presence():
     print(f"[tracker] Checked {len(tracked_user_ids)} user(s), {len(currently_in_game)} currently in target game")
 
     new_joins = currently_in_game - last_in_game
+    new_leaves = last_in_game - currently_in_game
     last_in_game = currently_in_game
+    await save_state()
 
-    if new_joins:
-        print(f"[tracker] {len(new_joins)} new join(s) detected, sending notification")
+    if new_joins or new_leaves:
         channel = bot.get_channel(NOTIFY_CHANNEL_ID)
-        if channel:
-            for _ in new_joins:
-                await channel.send("Someone on the watchlist just joined the game.")
-        else:
+        if not channel:
             print(f"[tracker] Could not find channel with ID {NOTIFY_CHANNEL_ID}")
+            return
+
+        for _ in new_joins:
+            try:
+                msg = await channel.send("Someone on the watchlist just joined the game.")
+                print(f"[tracker] Join notification sent, message ID: {msg.id}")
+            except Exception as e:
+                print(f"[tracker] Failed to send join notification: {type(e).__name__}: {e}")
+
+        for _ in new_leaves:
+            try:
+                msg = await channel.send("Someone on the watchlist just left the game.")
+                print(f"[tracker] Leave notification sent, message ID: {msg.id}")
+            except Exception as e:
+                print(f"[tracker] Failed to send leave notification: {type(e).__name__}: {e}")
 
 
 @tasks.loop(seconds=60)
@@ -303,6 +387,7 @@ keep_alive()
 
 @bot.event
 async def setup_hook():
+    await load_state()
     refresh_loop.start()
     presence_loop.start()
 
