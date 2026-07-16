@@ -41,7 +41,7 @@ ADMIN_IDS = [925226542571855943]  # replace with your actual Discord user ID
 # Discord role ID allowed to use moderation commands (/kick, /ban, /warn,
 # /ground, /modlogs). Right-click the role in Server Settings -> Roles
 # (with Developer Mode on) -> Copy Role ID.
-MOD_ROLE_ID = 123456789012345678  # replace with your actual moderator role ID
+MOD_ROLE_ID = 1515690428974891089  # replace with your actual moderator role ID
 
 # Set this to your server's ID for instant slash-command syncing during
 # testing (guild syncs are instant; global syncs can take up to an hour
