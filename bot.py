@@ -28,7 +28,7 @@ DEFAULT_LEAVE_MSG = "{name} left the server"
 # these commands can post as your bot or change server-wide messages, so
 # keep this locked down to just you (and anyone else you trust).
 # Right-click your name in Discord (with Developer Mode on) -> Copy User ID
-ADMIN_IDS = [925226542571855943]  # replace with your actual Discord user ID
+ADMIN_IDS = [925226542571855943, 1193517948401373257]  # replace with your actual Discord user ID
 
 # Set this to your server's ID for instant slash-command syncing during
 # testing (guild syncs are instant; global syncs can take up to an hour
