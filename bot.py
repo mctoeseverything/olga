@@ -383,11 +383,31 @@ async def moderator_check(interaction: discord.Interaction) -> bool:
     return True
 
 
+async def send_punishment_dm(member: discord.Member, description: str, moderator: discord.Member):
+    """DM the punished member with the action embed and a disabled gray
+    button crediting the moderator who did it. Silently does nothing if
+    their DMs are closed (or the bot no longer shares a server with them)."""
+    dm_view = discord.ui.View()
+    dm_view.add_item(discord.ui.Button(
+        label=f"Sent with hate from: {moderator.display_name}",
+        style=discord.ButtonStyle.gray,
+        disabled=True,
+    ))
+    try:
+        await member.send(embed=system_embed(description), view=dm_view)
+    except discord.HTTPException:
+        pass
+
+
 @bot.tree.command(name="kick", description="Kick a member from the server")
 @app_commands.describe(member="Who to kick", reason="Why they're being kicked")
 async def slash_kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
     if not await moderator_check(interaction):
         return
+
+    # DM before kicking - once they're removed, the bot may no longer
+    # share a server with them and the DM could fail to send.
+    await send_punishment_dm(member, f"Pfftth, you were kicked from **{interaction.guild.name}**: {reason}. Don't misbehave again or we may have to get the belt out pfftth.", interaction.user)
 
     try:
         await member.kick(reason=f"{reason} (by {interaction.user})")
@@ -399,7 +419,7 @@ async def slash_kick(interaction: discord.Interaction, member: discord.Member, r
         return
 
     await log_mod_action(interaction.guild.id, member.id, "kick", reason, interaction.user.id)
-    await interaction.response.send_message(embed=system_embed(f"👢 Kicked {member.mention} - {reason}"))
+    await interaction.response.send_message(embed=system_embed(f"👢 Kicked {member.mention}: {reason}"))
 
 
 @bot.tree.command(name="ban", description="Ban a member from the server")
@@ -407,6 +427,10 @@ async def slash_kick(interaction: discord.Interaction, member: discord.Member, r
 async def slash_ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided", delete_message_days: app_commands.Range[int, 0, 7] = 0):
     if not await moderator_check(interaction):
         return
+
+    # DM before banning - once they're removed, the bot may no longer
+    # share a server with them and the DM could fail to send.
+    await send_punishment_dm(member, f"Pfftth, you were banned in **{interaction.guild.name}**: {reason}. Don't misbehave again or we may have to get the belt out pfftth.", interaction.user)
 
     try:
         await member.ban(reason=f"{reason} (by {interaction.user})", delete_message_seconds=delete_message_days * 86400)
@@ -428,12 +452,8 @@ async def slash_warn(interaction: discord.Interaction, member: discord.Member, r
         return
 
     await log_mod_action(interaction.guild.id, member.id, "warn", reason, interaction.user.id)
-    await interaction.response.send_message(embed=system_embed(f"⚠️ Warned {member.mention} - {reason}"))
-
-    try:
-        await member.send(embed=system_embed(f"You were warned in **{interaction.guild.name}**: {reason}"))
-    except discord.HTTPException:
-        pass  # their DMs are closed, that's fine
+    await interaction.response.send_message(embed=system_embed(f"Warned {member.mention}: {reason}"))
+    await send_punishment_dm(member, f"Pfftth, you were warned in **{interaction.guild.name}**: {reason}. Don't misbehave again or we may have to get the belt out pfftth", interaction.user)
 
 
 @bot.tree.command(name="ground", description="Timeout (ground) a member for a set number of minutes")
