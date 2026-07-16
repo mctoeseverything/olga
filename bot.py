@@ -18,12 +18,12 @@ NOTIFY_CHANNEL_ID = 1513932318119825548  # Discord channel ID to post notificati
 TOKEN = os.getenv("DISCORD_TOKEN")  # set this as an environment variable, don't paste your token here
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # get this free from console.groq.com
 ROBLOX_COOKIE = os.getenv("ROBLOX_COOKIE")  # .ROBLOSECURITY cookie value, see setup notes
-STATUS_TEXT = "Olga Family: Season 3.5"  # change this to whatever you want
+STATUS_TEXT = "Olga Family: Season 4"  # change this to whatever you want
 
 # Only these Discord user IDs can use -send - this command can post as your
 # bot to ANY channel it has access to, so keep this locked down to just you.
 # Right-click your name in Discord (with Developer Mode on) -> Copy User ID
-ADMIN_IDS = [123456789012345678]  # replace with your actual Discord user ID
+ADMIN_IDS = [925226542571855943]  # replace with your actual Discord user ID
 
 # ---- Keep-alive web server ----
 # Render needs an open port to consider the service "alive", and a free
@@ -71,8 +71,8 @@ async def roast(ctx, member: discord.Member = None):
     await ctx.typing()
 
     prompt = (
-     f"Write a short, savage roast (1-2 sentences) for {member.display_name}. "
-f"Be extremely rude, mean, and brutal. Be creative, not traditional. Use curse words. Roast their fat ass, ugly face, stupid personality, smell, laziness — go hard. "
+     f"Write a short, savage roast (1 sentence) for {member.display_name}. "
+f"Be extremely rude, mean, and brutal. Be creative, not traditional. Use curse words. Roast their fatass, ugly face, stupid personality, smell, laziness — go hard. "
 f"Make it funny and vicious. "
 f"Absolutely no race, ethnicity, sexuality, or homophobic shit."
     )
