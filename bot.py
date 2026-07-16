@@ -33,7 +33,7 @@ ADMIN_IDS = [925226542571855943]  # replace with your actual Discord user ID
 # Set this to your server's ID for instant slash-command syncing during
 # testing (guild syncs are instant; global syncs can take up to an hour
 # to show up everywhere). Leave as None to sync globally instead.
-DEV_GUILD_ID = None  # e.g. 123456789012345678
+DEV_GUILD_ID = 1469696264407879814  # e.g. 123456789012345678
 
 # ---- MongoDB setup ----
 # Used to persist tracker state (tracked user IDs + who's currently in-game)
