@@ -6,6 +6,7 @@ import threading
 import requests
 import json
 import aiohttp
+import datetime
 import motor.motor_asyncio
 from flask import Flask
 
@@ -27,8 +28,8 @@ DEFAULT_GREET_COLOR = discord.Color.green()
 DEFAULT_LEAVE_COLOR = discord.Color.red()
 
 # Color used for all of the bot's own regular replies (permission denials,
-# confirmations, errors, etc). Change this one value to recolor every
-# "system" embed the bot sends at once.
+# confirmations, errors, mod command results, etc). Change this one value
+# to recolor every "system" embed the bot sends at once.
 SYSTEM_EMBED_COLOR = discord.Color.from_str("#f30d25")
 
 # Only these Discord user IDs can use -send, /setgreetmsg, /setleavemsg -
@@ -37,16 +38,23 @@ SYSTEM_EMBED_COLOR = discord.Color.from_str("#f30d25")
 # Right-click your name in Discord (with Developer Mode on) -> Copy User ID
 ADMIN_IDS = [925226542571855943]  # replace with your actual Discord user ID
 
+# Discord role ID allowed to use moderation commands (/kick, /ban, /warn,
+# /ground, /modlogs). Right-click the role in Server Settings -> Roles
+# (with Developer Mode on) -> Copy Role ID.
+MOD_ROLE_ID = 123456789012345678  # replace with your actual moderator role ID
+
 # Set this to your server's ID for instant slash-command syncing during
 # testing (guild syncs are instant; global syncs can take up to an hour
 # to show up everywhere). Leave as None to sync globally instead.
 DEV_GUILD_ID = 1469696264407879814  # e.g. 123456789012345678
 
 # ---- MongoDB setup ----
-# Used to persist per-guild greet/leave messages across restarts/redeploys.
+# Used to persist per-guild greet/leave messages and moderation history
+# across restarts/redeploys.
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI) if MONGODB_URI else None
 db = mongo_client["olgabot"] if mongo_client else None
 settings_collection = db["greet_leave_settings"] if db is not None else None
+mod_actions_collection = db["mod_actions"] if db is not None else None
 
 # In-memory cache of per-guild messages/colors, loaded from MongoDB on
 # startup and kept in sync whenever /setgreetmsg or /setleavemsg is used.
@@ -288,8 +296,6 @@ async def on_member_join(member):
             description=format_member_message(template, member),
             color=get_greet_color(member.guild.id),
         )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        embed.set_footer(text=f"Member #{member.guild.member_count}")
         await channel.send(embed=embed)
     else:
         print(f"[welcome] Could not find channel with ID {WELCOME_CHANNEL_ID}")
@@ -304,11 +310,180 @@ async def on_member_remove(member):
             description=format_member_message(template, member),
             color=get_leave_color(member.guild.id),
         )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        embed.set_footer(text=f"Member #{member.guild.member_count}")
         await channel.send(embed=embed)
     else:
         print(f"[welcome] Could not find channel with ID {WELCOME_CHANNEL_ID}")
+
+
+# ---- Moderation ----
+# /kick, /ban, /warn, /ground (timeout), and /modlogs (history lookup).
+# Restricted to members holding the MOD_ROLE_ID role, configured above.
+
+MOD_ACTION_LABELS = {
+    "kick": "Kicked",
+    "ban": "Banned",
+    "warn": "Warned",
+    "ground": "Grounded",
+}
+
+# Discord's hard cap on timeouts is 28 days.
+MAX_GROUND_MINUTES = 40320
+
+
+def is_moderator(user) -> bool:
+    if not isinstance(user, discord.Member):
+        return False
+    return any(role.id == MOD_ROLE_ID for role in user.roles)
+
+
+async def log_mod_action(guild_id: int, target_id: int, action_type: str, reason: str, moderator_id: int, duration_minutes: int = None):
+    """Record a moderation action so it shows up in /modlogs."""
+    if mod_actions_collection is None:
+        print("[mod] MONGODB_URI not set, moderation action was not logged")
+        return
+    doc = {
+        "guild_id": guild_id,
+        "target_id": target_id,
+        "type": action_type,
+        "reason": reason,
+        "moderator_id": moderator_id,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc),
+    }
+    if duration_minutes is not None:
+        doc["duration_minutes"] = duration_minutes
+    try:
+        await mod_actions_collection.insert_one(doc)
+    except Exception as e:
+        print(f"[mod] Failed to log {action_type} for user {target_id}: {type(e).__name__}: {e}")
+
+
+async def get_mod_history(guild_id: int, target_id: int, limit: int = 15):
+    """Return a user's past moderation actions in this guild, most recent first."""
+    if mod_actions_collection is None:
+        return []
+    try:
+        cursor = mod_actions_collection.find(
+            {"guild_id": guild_id, "target_id": target_id}
+        ).sort("timestamp", -1).limit(limit)
+        return await cursor.to_list(length=limit)
+    except Exception as e:
+        print(f"[mod] Failed to fetch history for user {target_id}: {type(e).__name__}: {e}")
+        return []
+
+
+async def moderator_check(interaction: discord.Interaction) -> bool:
+    """Shared guard for all moderation commands. Sends a denial reply and
+    returns False if the command shouldn't proceed."""
+    if interaction.guild is None:
+        await interaction.response.send_message(embed=system_embed("This command can only be used in a server."), ephemeral=True)
+        return False
+    if not is_moderator(interaction.user):
+        await interaction.response.send_message(embed=system_embed("You're not allowed to use this command."), ephemeral=True)
+        return False
+    return True
+
+
+@bot.tree.command(name="kick", description="Kick a member from the server")
+@app_commands.describe(member="Who to kick", reason="Why they're being kicked")
+async def slash_kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if not await moderator_check(interaction):
+        return
+
+    try:
+        await member.kick(reason=f"{reason} (by {interaction.user})")
+    except discord.Forbidden:
+        await interaction.response.send_message(embed=system_embed("I don't have permission to kick that member."), ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        await interaction.response.send_message(embed=system_embed(f"Failed to kick: {e}"), ephemeral=True)
+        return
+
+    await log_mod_action(interaction.guild.id, member.id, "kick", reason, interaction.user.id)
+    await interaction.response.send_message(embed=system_embed(f"👢 Kicked {member.mention} - {reason}"))
+
+
+@bot.tree.command(name="ban", description="Ban a member from the server")
+@app_commands.describe(member="Who to ban", reason="Why they're being banned", delete_message_days="Days of their message history to delete (0-7, default 0)")
+async def slash_ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided", delete_message_days: app_commands.Range[int, 0, 7] = 0):
+    if not await moderator_check(interaction):
+        return
+
+    try:
+        await member.ban(reason=f"{reason} (by {interaction.user})", delete_message_seconds=delete_message_days * 86400)
+    except discord.Forbidden:
+        await interaction.response.send_message(embed=system_embed("I don't have permission to ban that member."), ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        await interaction.response.send_message(embed=system_embed(f"Failed to ban: {e}"), ephemeral=True)
+        return
+
+    await log_mod_action(interaction.guild.id, member.id, "ban", reason, interaction.user.id)
+    await interaction.response.send_message(embed=system_embed(f"🔨 Banned {member.mention} - {reason}"))
+
+
+@bot.tree.command(name="warn", description="Log a warning against a member")
+@app_commands.describe(member="Who to warn", reason="What they're being warned for")
+async def slash_warn(interaction: discord.Interaction, member: discord.Member, reason: str):
+    if not await moderator_check(interaction):
+        return
+
+    await log_mod_action(interaction.guild.id, member.id, "warn", reason, interaction.user.id)
+    await interaction.response.send_message(embed=system_embed(f"⚠️ Warned {member.mention} - {reason}"))
+
+    try:
+        await member.send(embed=system_embed(f"You were warned in **{interaction.guild.name}**: {reason}"))
+    except discord.HTTPException:
+        pass  # their DMs are closed, that's fine
+
+
+@bot.tree.command(name="ground", description="Timeout (ground) a member for a set number of minutes")
+@app_commands.describe(member="Who to ground", duration_minutes="How long to ground them for, in minutes", reason="Why they're being grounded")
+async def slash_ground(interaction: discord.Interaction, member: discord.Member, duration_minutes: app_commands.Range[int, 1, MAX_GROUND_MINUTES], reason: str = "No reason provided"):
+    if not await moderator_check(interaction):
+        return
+
+    until = discord.utils.utcnow() + datetime.timedelta(minutes=duration_minutes)
+    try:
+        await member.timeout(until, reason=f"{reason} (by {interaction.user})")
+    except discord.Forbidden:
+        await interaction.response.send_message(embed=system_embed("I don't have permission to ground that member."), ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        await interaction.response.send_message(embed=system_embed(f"Failed to ground: {e}"), ephemeral=True)
+        return
+
+    await log_mod_action(interaction.guild.id, member.id, "ground", reason, interaction.user.id, duration_minutes=duration_minutes)
+    await interaction.response.send_message(embed=system_embed(f"🧎 Grounded {member.mention} for {duration_minutes} minute(s) - {reason}"))
+
+
+@bot.tree.command(name="modlogs", description="View a member's past moderation history")
+@app_commands.describe(member="Whose history to look up")
+async def slash_modlogs(interaction: discord.Interaction, member: discord.Member):
+    if not await moderator_check(interaction):
+        return
+
+    history = await get_mod_history(interaction.guild.id, member.id)
+
+    embed = discord.Embed(
+        title=f"Moderation history - {member.display_name}",
+        color=SYSTEM_EMBED_COLOR,
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    if not history:
+        embed.description = "No moderation actions on record."
+    else:
+        for entry in history:
+            label = MOD_ACTION_LABELS.get(entry["type"], entry["type"].title())
+            timestamp = entry["timestamp"]
+            unix_ts = int(timestamp.replace(tzinfo=datetime.timezone.utc).timestamp()) if timestamp.tzinfo is None else int(timestamp.timestamp())
+            field_name = f"{label} - <t:{unix_ts}:R>"
+            field_value = f"Reason: {entry.get('reason', 'No reason provided')}\nBy: <@{entry['moderator_id']}>"
+            if entry.get("duration_minutes") is not None:
+                field_value += f"\nDuration: {entry['duration_minutes']} minute(s)"
+            embed.add_field(name=field_name, value=field_value, inline=False)
+
+    await interaction.response.send_message(embed=embed)
 
 
 # ---- Prefix commands (e.g. -ping) ----
