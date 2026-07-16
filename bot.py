@@ -23,12 +23,19 @@ WELCOME_CHANNEL_ID = 1513932845922385920  # change this if you want a different 
 # actually ping the person, or {name} for their display name with no ping.
 DEFAULT_GREET_MSG = "welcome to the server {mention}, glad you're here"
 DEFAULT_LEAVE_MSG = "{name} left the server"
+DEFAULT_GREET_COLOR = discord.Color.green()
+DEFAULT_LEAVE_COLOR = discord.Color.red()
+
+# Color used for all of the bot's own regular replies (permission denials,
+# confirmations, errors, etc). Change this one value to recolor every
+# "system" embed the bot sends at once.
+SYSTEM_EMBED_COLOR = discord.Color.from_str("#f30d25")
 
 # Only these Discord user IDs can use -send, /setgreetmsg, /setleavemsg -
 # these commands can post as your bot or change server-wide messages, so
 # keep this locked down to just you (and anyone else you trust).
 # Right-click your name in Discord (with Developer Mode on) -> Copy User ID
-ADMIN_IDS = [925226542571855943, 1193517948401373257]  # replace with your actual Discord user ID
+ADMIN_IDS = [925226542571855943]  # replace with your actual Discord user ID
 
 # Set this to your server's ID for instant slash-command syncing during
 # testing (guild syncs are instant; global syncs can take up to an hour
@@ -41,9 +48,9 @@ mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI) if MONGODB_UR
 db = mongo_client["olgabot"] if mongo_client else None
 settings_collection = db["greet_leave_settings"] if db is not None else None
 
-# In-memory cache of per-guild messages, loaded from MongoDB on startup and
-# kept in sync whenever /setgreetmsg or /setleavemsg is used.
-# Structure: { guild_id: {"greet": "...", "leave": "..."} }
+# In-memory cache of per-guild messages/colors, loaded from MongoDB on
+# startup and kept in sync whenever /setgreetmsg or /setleavemsg is used.
+# Structure: { guild_id: {"greet": "...", "greet_color": int, "leave": "...", "leave_color": int} }
 guild_messages = {}
 
 # ---- Keep-alive web server ----
@@ -98,7 +105,7 @@ async def on_ready():
 # ---- Greet/leave message settings ----
 
 async def load_guild_messages():
-    """Load all per-guild greet/leave messages from MongoDB on startup."""
+    """Load all per-guild greet/leave messages and colors from MongoDB on startup."""
     global guild_messages
     if settings_collection is None:
         print("[settings] MONGODB_URI not set, skipping load (using defaults/in-memory only)")
@@ -107,28 +114,36 @@ async def load_guild_messages():
         async for doc in settings_collection.find({}):
             guild_messages[doc["_id"]] = {
                 "greet": doc.get("greet", DEFAULT_GREET_MSG),
+                "greet_color": doc.get("greet_color", DEFAULT_GREET_COLOR.value),
                 "leave": doc.get("leave", DEFAULT_LEAVE_MSG),
+                "leave_color": doc.get("leave_color", DEFAULT_LEAVE_COLOR.value),
             }
         print(f"[settings] Loaded custom messages for {len(guild_messages)} guild(s)")
     except Exception as e:
         print(f"[settings] Failed to load settings from MongoDB: {type(e).__name__}: {e}")
 
 
-async def save_guild_message(guild_id: int, key: str, message: str):
-    """Persist a single guild's greet or leave message to MongoDB and update the cache."""
-    guild_messages.setdefault(guild_id, {"greet": DEFAULT_GREET_MSG, "leave": DEFAULT_LEAVE_MSG})
-    guild_messages[guild_id][key] = message
+async def save_guild_field(guild_id: int, field: str, value):
+    """Persist a single field (greet, greet_color, leave, or leave_color) for a guild
+    to MongoDB and update the in-memory cache."""
+    guild_messages.setdefault(guild_id, {
+        "greet": DEFAULT_GREET_MSG,
+        "greet_color": DEFAULT_GREET_COLOR.value,
+        "leave": DEFAULT_LEAVE_MSG,
+        "leave_color": DEFAULT_LEAVE_COLOR.value,
+    })
+    guild_messages[guild_id][field] = value
 
     if settings_collection is None:
         return
     try:
         await settings_collection.update_one(
             {"_id": guild_id},
-            {"$set": {key: message}},
+            {"$set": {field: value}},
             upsert=True,
         )
     except Exception as e:
-        print(f"[settings] Failed to save {key} message for guild {guild_id}: {type(e).__name__}: {e}")
+        print(f"[settings] Failed to save {field} for guild {guild_id}: {type(e).__name__}: {e}")
 
 
 def get_greet_message(guild_id: int) -> str:
@@ -137,6 +152,51 @@ def get_greet_message(guild_id: int) -> str:
 
 def get_leave_message(guild_id: int) -> str:
     return guild_messages.get(guild_id, {}).get("leave", DEFAULT_LEAVE_MSG)
+
+
+def get_greet_color(guild_id: int) -> discord.Color:
+    return discord.Color(guild_messages.get(guild_id, {}).get("greet_color", DEFAULT_GREET_COLOR.value))
+
+
+def get_leave_color(guild_id: int) -> discord.Color:
+    return discord.Color(guild_messages.get(guild_id, {}).get("leave_color", DEFAULT_LEAVE_COLOR.value))
+
+
+# Named colors accepted by /setgreetmsg and /setleavemsg, in addition to hex
+# codes like #57F287. Add more here if you want other named options.
+NAMED_COLORS = {
+    "red": discord.Color.red(),
+    "green": discord.Color.green(),
+    "blue": discord.Color.blue(),
+    "blurple": discord.Color.blurple(),
+    "greyple": discord.Color.greyple(),
+    "gold": discord.Color.gold(),
+    "orange": discord.Color.orange(),
+    "purple": discord.Color.purple(),
+    "magenta": discord.Color.magenta(),
+    "teal": discord.Color.teal(),
+    "dark_red": discord.Color.dark_red(),
+    "dark_green": discord.Color.dark_green(),
+    "dark_blue": discord.Color.dark_blue(),
+    "dark_purple": discord.Color.dark_purple(),
+    "yellow": discord.Color.yellow(),
+    "black": discord.Color.from_str("#000000"),
+    "white": discord.Color.from_str("#FFFFFF"),
+}
+
+
+def parse_color(color_str: str):
+    """Parse a hex code (e.g. '#57F287' or '57F287') or a name from
+    NAMED_COLORS into a discord.Color. Returns None if it can't be parsed."""
+    color_str = color_str.strip()
+    named = NAMED_COLORS.get(color_str.lower())
+    if named is not None:
+        return named
+    hex_str = color_str.lstrip("#")
+    try:
+        return discord.Color(int(hex_str, 16))
+    except ValueError:
+        return None
 
 
 def format_member_message(template: str, member: discord.Member) -> str:
@@ -149,34 +209,73 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-@bot.tree.command(name="setgreetmsg", description="Set the message posted when someone joins the server")
-@app_commands.describe(message="Use {mention} to ping them, or {name} for their display name (no ping)")
-async def slash_setgreetmsg(interaction: discord.Interaction, message: str):
+def system_embed(description: str) -> discord.Embed:
+    """Build a consistently-colored embed for the bot's own replies
+    (denials, confirmations, errors). Change SYSTEM_EMBED_COLOR above to
+    recolor all of these at once."""
+    return discord.Embed(description=description, color=SYSTEM_EMBED_COLOR)
+
+
+@bot.tree.command(name="setgreetmsg", description="Set the message (and optionally color) posted when someone joins")
+@app_commands.describe(
+    message="Use {mention} to ping them, or {name} for their display name (no ping)",
+    color="Hex code like #57F287, or a name like green, red, blue, gold, purple, etc. (optional)",
+)
+async def slash_setgreetmsg(interaction: discord.Interaction, message: str, color: str = None):
     if not is_admin(interaction.user.id):
-        await interaction.response.send_message("You're not allowed to use this command.", ephemeral=True)
+        await interaction.response.send_message(embed=system_embed("You're not allowed to use this command."), ephemeral=True)
         return
     if interaction.guild is None:
-        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        await interaction.response.send_message(embed=system_embed("This command can only be used in a server."), ephemeral=True)
         return
 
-    await save_guild_message(interaction.guild.id, "greet", message)
-    preview = format_member_message(message, interaction.user) if isinstance(interaction.user, discord.Member) else message
-    await interaction.response.send_message(f"Greet message updated. Preview: {preview}")
+    await save_guild_field(interaction.guild.id, "greet", message)
+
+    parsed_color = None
+    color_note = ""
+    if color:
+        parsed_color = parse_color(color)
+        if parsed_color is None:
+            color_note = f"\n\n⚠️ Couldn't parse color `{color}` - message was saved, but the color wasn't changed."
+        else:
+            await save_guild_field(interaction.guild.id, "greet_color", parsed_color.value)
+
+    preview_text = format_member_message(message, interaction.user) if isinstance(interaction.user, discord.Member) else message
+    preview_color = parsed_color if parsed_color is not None else get_greet_color(interaction.guild.id)
+    preview = discord.Embed(description=preview_text, color=preview_color)
+    preview.set_footer(text="Greet message updated" + color_note)
+    await interaction.response.send_message(embed=preview)
 
 
-@bot.tree.command(name="setleavemsg", description="Set the message posted when someone leaves the server")
-@app_commands.describe(message="Use {mention} to ping them, or {name} for their display name (no ping)")
-async def slash_setleavemsg(interaction: discord.Interaction, message: str):
+@bot.tree.command(name="setleavemsg", description="Set the message (and optionally color) posted when someone leaves")
+@app_commands.describe(
+    message="Use {mention} to ping them, or {name} for their display name (no ping)",
+    color="Hex code like #ED4245, or a name like red, green, blue, gold, purple, etc. (optional)",
+)
+async def slash_setleavemsg(interaction: discord.Interaction, message: str, color: str = None):
     if not is_admin(interaction.user.id):
-        await interaction.response.send_message("You're not allowed to use this command.", ephemeral=True)
+        await interaction.response.send_message(embed=system_embed("You're not allowed to use this command."), ephemeral=True)
         return
     if interaction.guild is None:
-        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        await interaction.response.send_message(embed=system_embed("This command can only be used in a server."), ephemeral=True)
         return
 
-    await save_guild_message(interaction.guild.id, "leave", message)
-    preview = format_member_message(message, interaction.user) if isinstance(interaction.user, discord.Member) else message
-    await interaction.response.send_message(f"Leave message updated. Preview: {preview}")
+    await save_guild_field(interaction.guild.id, "leave", message)
+
+    parsed_color = None
+    color_note = ""
+    if color:
+        parsed_color = parse_color(color)
+        if parsed_color is None:
+            color_note = f"\n\n⚠️ Couldn't parse color `{color}` - message was saved, but the color wasn't changed."
+        else:
+            await save_guild_field(interaction.guild.id, "leave_color", parsed_color.value)
+
+    preview_text = format_member_message(message, interaction.user) if isinstance(interaction.user, discord.Member) else message
+    preview_color = parsed_color if parsed_color is not None else get_leave_color(interaction.guild.id)
+    preview = discord.Embed(description=preview_text, color=preview_color)
+    preview.set_footer(text="Leave message updated" + color_note)
+    await interaction.response.send_message(embed=preview)
 
 
 # ---- Server join/leave messages ----
@@ -185,7 +284,13 @@ async def on_member_join(member):
     channel = bot.get_channel(WELCOME_CHANNEL_ID)
     if channel:
         template = get_greet_message(member.guild.id)
-        await channel.send(format_member_message(template, member))
+        embed = discord.Embed(
+            description=format_member_message(template, member),
+            color=get_greet_color(member.guild.id),
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text=f"Member #{member.guild.member_count}")
+        await channel.send(embed=embed)
     else:
         print(f"[welcome] Could not find channel with ID {WELCOME_CHANNEL_ID}")
 
@@ -195,7 +300,13 @@ async def on_member_remove(member):
     channel = bot.get_channel(WELCOME_CHANNEL_ID)
     if channel:
         template = get_leave_message(member.guild.id)
-        await channel.send(format_member_message(template, member))
+        embed = discord.Embed(
+            description=format_member_message(template, member),
+            color=get_leave_color(member.guild.id),
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text=f"Member #{member.guild.member_count}")
+        await channel.send(embed=embed)
     else:
         print(f"[welcome] Could not find channel with ID {WELCOME_CHANNEL_ID}")
 
@@ -322,7 +433,7 @@ async def send_raw_message(channel_id, payload: dict, files=None):
 @bot.command()
 async def send(ctx, channel: discord.TextChannel, *, payload: str):
     if ctx.author.id not in ADMIN_IDS:
-        await ctx.send("You're not allowed to use this command.")
+        await ctx.send(embed=system_embed("You're not allowed to use this command."))
         return
 
     payload = payload.strip()
@@ -336,7 +447,7 @@ async def send(ctx, channel: discord.TextChannel, *, payload: str):
     try:
         data = json.loads(payload)
     except json.JSONDecodeError as e:
-        await ctx.send(f"That's not valid JSON: {e}")
+        await ctx.send(embed=system_embed(f"That's not valid JSON: {e}"))
         return
 
     files = []
@@ -350,9 +461,9 @@ async def send(ctx, channel: discord.TextChannel, *, payload: str):
     result, status = await send_raw_message(channel.id, data, files=files or None)
 
     if status >= 300:
-        await ctx.send(f"Discord rejected it ({status}): {result.get('message', result)}")
+        await ctx.send(embed=system_embed(f"Discord rejected it ({status}): {result.get('message', result)}"))
     else:
-        await ctx.send(f"Sent to {channel.mention}")
+        await ctx.send(embed=system_embed(f"Sent to {channel.mention}"))
 
 
 keep_alive()
