@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 import os
 import threading
 import requests
@@ -7,26 +8,25 @@ import json
 import aiohttp
 import motor.motor_asyncio
 from flask import Flask
-from discord.ext import tasks
-
-# ---- Group rank presence tracker config ----
-GROUP_ID = 32860910  # your Roblox group ID
-TRACKED_ROLE_IDS = [100231905]  # role IDs to watch
-TARGET_PLACE_ID = 17333697975  # the specific game's place ID to watch for
-NOTIFY_CHANNEL_ID = 1513932318119825548  # Discord channel ID to post notifications in
 
 # ---- Config ----
 TOKEN = os.getenv("DISCORD_TOKEN")  # set this as an environment variable, don't paste your token here
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # get this free from console.groq.com
-ROBLOX_COOKIE = os.getenv("ROBLOX_COOKIE")  # .ROBLOSECURITY cookie value, see setup notes
 MONGODB_URI = os.getenv("MONGODB_URI")  # e.g. mongodb+srv://user:pass@cluster.mongodb.net
 STATUS_TEXT = "Olga Family: Season 4"  # change this to whatever you want
 
 # Discord channel to post server member join/leave messages in
 WELCOME_CHANNEL_ID = 1513932845922385920  # change this if you want a different channel
 
-# Only these Discord user IDs can use -send - this command can post as your
-# bot to ANY channel it has access to, so keep this locked down to just you.
+# Default greet/leave messages, used until someone sets a custom one with
+# /setgreetmsg or /setleavemsg. Use {mention} (or {member}, same thing) to
+# actually ping the person, or {name} for their display name with no ping.
+DEFAULT_GREET_MSG = "welcome to the server {mention}, glad you're here"
+DEFAULT_LEAVE_MSG = "{name} left the server"
+
+# Only these Discord user IDs can use -send, /setgreetmsg, /setleavemsg -
+# these commands can post as your bot or change server-wide messages, so
+# keep this locked down to just you (and anyone else you trust).
 # Right-click your name in Discord (with Developer Mode on) -> Copy User ID
 ADMIN_IDS = [925226542571855943]  # replace with your actual Discord user ID
 
@@ -36,12 +36,15 @@ ADMIN_IDS = [925226542571855943]  # replace with your actual Discord user ID
 DEV_GUILD_ID = 1469696264407879814  # e.g. 123456789012345678
 
 # ---- MongoDB setup ----
-# Used to persist tracker state (tracked user IDs + who's currently in-game)
-# across restarts/redeploys, so we don't lose state or send spurious
-# "just joined" notifications when the bot comes back up.
+# Used to persist per-guild greet/leave messages across restarts/redeploys.
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI) if MONGODB_URI else None
 db = mongo_client["olgabot"] if mongo_client else None
-state_collection = db["tracker_state"] if db is not None else None
+settings_collection = db["greet_leave_settings"] if db is not None else None
+
+# In-memory cache of per-guild messages, loaded from MongoDB on startup and
+# kept in sync whenever /setgreetmsg or /setleavemsg is used.
+# Structure: { guild_id: {"greet": "...", "leave": "..."} }
+guild_messages = {}
 
 # ---- Keep-alive web server ----
 # Render needs an open port to consider the service "alive", and a free
@@ -92,12 +95,97 @@ async def on_ready():
         print(f"Slash command sync failed: {e}")
 
 
+# ---- Greet/leave message settings ----
+
+async def load_guild_messages():
+    """Load all per-guild greet/leave messages from MongoDB on startup."""
+    global guild_messages
+    if settings_collection is None:
+        print("[settings] MONGODB_URI not set, skipping load (using defaults/in-memory only)")
+        return
+    try:
+        async for doc in settings_collection.find({}):
+            guild_messages[doc["_id"]] = {
+                "greet": doc.get("greet", DEFAULT_GREET_MSG),
+                "leave": doc.get("leave", DEFAULT_LEAVE_MSG),
+            }
+        print(f"[settings] Loaded custom messages for {len(guild_messages)} guild(s)")
+    except Exception as e:
+        print(f"[settings] Failed to load settings from MongoDB: {type(e).__name__}: {e}")
+
+
+async def save_guild_message(guild_id: int, key: str, message: str):
+    """Persist a single guild's greet or leave message to MongoDB and update the cache."""
+    guild_messages.setdefault(guild_id, {"greet": DEFAULT_GREET_MSG, "leave": DEFAULT_LEAVE_MSG})
+    guild_messages[guild_id][key] = message
+
+    if settings_collection is None:
+        return
+    try:
+        await settings_collection.update_one(
+            {"_id": guild_id},
+            {"$set": {key: message}},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[settings] Failed to save {key} message for guild {guild_id}: {type(e).__name__}: {e}")
+
+
+def get_greet_message(guild_id: int) -> str:
+    return guild_messages.get(guild_id, {}).get("greet", DEFAULT_GREET_MSG)
+
+
+def get_leave_message(guild_id: int) -> str:
+    return guild_messages.get(guild_id, {}).get("leave", DEFAULT_LEAVE_MSG)
+
+
+def format_member_message(template: str, member: discord.Member) -> str:
+    # {mention} and {member} both insert an actual ping (e.g. <@123456789>);
+    # {name} inserts their display name with no ping.
+    return template.format(mention=member.mention, member=member.mention, name=member.display_name)
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+@bot.tree.command(name="setgreetmsg", description="Set the message posted when someone joins the server")
+@app_commands.describe(message="Use {mention} to ping them, or {name} for their display name (no ping)")
+async def slash_setgreetmsg(interaction: discord.Interaction, message: str):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("You're not allowed to use this command.", ephemeral=True)
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    await save_guild_message(interaction.guild.id, "greet", message)
+    preview = format_member_message(message, interaction.user) if isinstance(interaction.user, discord.Member) else message
+    await interaction.response.send_message(f"Greet message updated. Preview: {preview}")
+
+
+@bot.tree.command(name="setleavemsg", description="Set the message posted when someone leaves the server")
+@app_commands.describe(message="Use {mention} to ping them, or {name} for their display name (no ping)")
+async def slash_setleavemsg(interaction: discord.Interaction, message: str):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("You're not allowed to use this command.", ephemeral=True)
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    await save_guild_message(interaction.guild.id, "leave", message)
+    preview = format_member_message(message, interaction.user) if isinstance(interaction.user, discord.Member) else message
+    await interaction.response.send_message(f"Leave message updated. Preview: {preview}")
+
+
 # ---- Server join/leave messages ----
 @bot.event
 async def on_member_join(member):
     channel = bot.get_channel(WELCOME_CHANNEL_ID)
     if channel:
-        await channel.send(f"welcome to the server {member.mention}, glad you're here")
+        template = get_greet_message(member.guild.id)
+        await channel.send(format_member_message(template, member))
     else:
         print(f"[welcome] Could not find channel with ID {WELCOME_CHANNEL_ID}")
 
@@ -106,7 +194,8 @@ async def on_member_join(member):
 async def on_member_remove(member):
     channel = bot.get_channel(WELCOME_CHANNEL_ID)
     if channel:
-        await channel.send(f"{member.display_name} left the server")
+        template = get_leave_message(member.guild.id)
+        await channel.send(format_member_message(template, member))
     else:
         print(f"[welcome] Could not find channel with ID {WELCOME_CHANNEL_ID}")
 
@@ -266,175 +355,10 @@ async def send(ctx, channel: discord.TextChannel, *, payload: str):
         await ctx.send(f"Sent to {channel.mention}")
 
 
-# ---- Group rank presence tracker ----
-# Watches a list of user IDs (people holding specific ranks in your Roblox
-# group) and notifies Discord when one of them joins a specific game -
-# without naming who it was.
-
-tracked_user_ids = set()
-last_in_game = set()  # user IDs we last saw in the target game
-
-
-async def load_state():
-    """Load tracked_user_ids and last_in_game from MongoDB on startup.
-    Keeps state across restarts/redeploys so we don't lose the tracked
-    list or send spurious join notifications when the bot comes back up."""
-    global tracked_user_ids, last_in_game
-    if state_collection is None:
-        print("[tracker] MONGODB_URI not set, skipping state load (using in-memory only)")
-        return
-    try:
-        doc = await state_collection.find_one({"_id": "tracker"})
-        if doc:
-            tracked_user_ids = set(doc.get("tracked_user_ids", []))
-            last_in_game = set(doc.get("last_in_game", []))
-            print(f"[tracker] Loaded state from MongoDB: {len(tracked_user_ids)} tracked, {len(last_in_game)} in-game")
-        else:
-            print("[tracker] No existing state found in MongoDB")
-    except Exception as e:
-        print(f"[tracker] Failed to load state from MongoDB: {type(e).__name__}: {e}")
-
-
-async def save_state():
-    """Persist tracked_user_ids and last_in_game to MongoDB."""
-    if state_collection is None:
-        return
-    try:
-        await state_collection.update_one(
-            {"_id": "tracker"},
-            {"$set": {
-                "tracked_user_ids": list(tracked_user_ids),
-                "last_in_game": list(last_in_game),
-            }},
-            upsert=True,
-        )
-    except Exception as e:
-        print(f"[tracker] Failed to save state to MongoDB: {type(e).__name__}: {e}")
-
-
-async def refresh_tracked_users():
-    """Pull user IDs for the tracked role(s) from Roblox's public group API."""
-    global tracked_user_ids
-    ids = set()
-    async with aiohttp.ClientSession() as session:
-        for role_id in TRACKED_ROLE_IDS:
-            cursor = ""
-            while True:
-                url = f"https://groups.roblox.com/v1/groups/{GROUP_ID}/roles/{role_id}/users?limit=100&cursor={cursor}"
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        print(f"[tracker] Failed to fetch role {role_id}: {resp.status}")
-                        break
-                    data = await resp.json()
-                    for user in data.get("data", []):
-                        ids.add(user["userId"])
-                    cursor = data.get("nextPageCursor")
-                    if not cursor:
-                        break
-    tracked_user_ids = ids
-    print(f"[tracker] Refreshed tracked list: {len(tracked_user_ids)} user(s) found for role(s) {TRACKED_ROLE_IDS}")
-    await save_state()
-
-
-async def get_csrf_token(session):
-    """Roblox requires an X-CSRF-TOKEN header for authenticated POST requests.
-    It's handed back in the response headers of a deliberately-failed request."""
-    async with session.post(
-        "https://auth.roblox.com/v2/logout",
-        headers={"Cookie": f".ROBLOSECURITY={ROBLOX_COOKIE}"},
-    ) as resp:
-        return resp.headers.get("x-csrf-token")
-
-
-async def check_presence():
-    """Check presence for all tracked users and notify on new joins/leaves for the target game."""
-    global last_in_game
-    if not tracked_user_ids or TARGET_PLACE_ID is None or NOTIFY_CHANNEL_ID is None:
-        print(f"[tracker] Skipping check - tracked_user_ids={len(tracked_user_ids)}, TARGET_PLACE_ID={TARGET_PLACE_ID}, NOTIFY_CHANNEL_ID={NOTIFY_CHANNEL_ID}")
-        return
-
-    headers = {}
-    if ROBLOX_COOKIE:
-        headers["Cookie"] = f".ROBLOSECURITY={ROBLOX_COOKIE}"
-
-    async with aiohttp.ClientSession() as session:
-        if ROBLOX_COOKIE:
-            csrf = await get_csrf_token(session)
-            if csrf:
-                headers["X-CSRF-TOKEN"] = csrf
-            else:
-                print("[tracker] Could not get CSRF token - cookie may be invalid/expired")
-
-        async with session.post(
-            "https://presence.roblox.com/v1/presence/users",
-            json={"userIds": list(tracked_user_ids)},
-            headers=headers,
-        ) as resp:
-            if resp.status != 200:
-                print(f"[tracker] Presence check failed: {resp.status}")
-                return
-            data = await resp.json()
-
-    currently_in_game = set()
-    for entry in data.get("userPresences", []):
-        # userPresenceType 2 = InGame. Check both placeId and rootPlaceId,
-        # since some experiences route joins through a different place ID
-        # than the one shown in the URL (e.g. multi-place games).
-        if entry.get("userPresenceType") == 2 and (
-            entry.get("placeId") == TARGET_PLACE_ID or entry.get("rootPlaceId") == TARGET_PLACE_ID
-        ):
-            currently_in_game.add(entry["userId"])
-
-    print(f"[tracker] Checked {len(tracked_user_ids)} user(s), {len(currently_in_game)} currently in target game")
-
-    new_joins = currently_in_game - last_in_game
-    new_leaves = last_in_game - currently_in_game
-    last_in_game = currently_in_game
-    await save_state()
-
-    if new_joins or new_leaves:
-        channel = bot.get_channel(NOTIFY_CHANNEL_ID)
-        if not channel:
-            print(f"[tracker] Could not find channel with ID {NOTIFY_CHANNEL_ID}")
-            return
-
-        for _ in new_joins:
-            try:
-                msg = await channel.send("Someone on the watchlist just joined the game.")
-                print(f"[tracker] Join notification sent, message ID: {msg.id}")
-            except Exception as e:
-                print(f"[tracker] Failed to send join notification: {type(e).__name__}: {e}")
-
-        for _ in new_leaves:
-            try:
-                msg = await channel.send("Someone on the watchlist just left the game.")
-                print(f"[tracker] Leave notification sent, message ID: {msg.id}")
-            except Exception as e:
-                print(f"[tracker] Failed to send leave notification: {type(e).__name__}: {e}")
-
-
-@tasks.loop(seconds=60)
-async def presence_loop():
-    await check_presence()
-
-
-@tasks.loop(hours=72)
-async def refresh_loop():
-    await refresh_tracked_users()
-
-
-@presence_loop.before_loop
-@refresh_loop.before_loop
-async def before_loops():
-    await bot.wait_until_ready()
-
-
 keep_alive()
 
 @bot.event
 async def setup_hook():
-    await load_state()
-    refresh_loop.start()
-    presence_loop.start()
+    await load_guild_messages()
 
 bot.run(TOKEN)
