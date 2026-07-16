@@ -23,12 +23,17 @@ MONGODB_URI = os.getenv("MONGODB_URI")  # e.g. mongodb+srv://user:pass@cluster.m
 STATUS_TEXT = "Olga Family: Season 4"  # change this to whatever you want
 
 # Discord channel to post server member join/leave messages in
-WELCOME_CHANNEL_ID = 1513932506603458580  # change this if you want a different channel
+WELCOME_CHANNEL_ID = 1513932845922385920  # change this if you want a different channel
 
 # Only these Discord user IDs can use -send - this command can post as your
 # bot to ANY channel it has access to, so keep this locked down to just you.
 # Right-click your name in Discord (with Developer Mode on) -> Copy User ID
 ADMIN_IDS = [925226542571855943]  # replace with your actual Discord user ID
+
+# Set this to your server's ID for instant slash-command syncing during
+# testing (guild syncs are instant; global syncs can take up to an hour
+# to show up everywhere). Leave as None to sync globally instead.
+DEV_GUILD_ID = None  # e.g. 123456789012345678
 
 # ---- MongoDB setup ----
 # Used to persist tracker state (tracked user IDs + who's currently in-game)
@@ -71,6 +76,21 @@ async def on_ready():
         status=discord.Status.online
     )
 
+    # Sync slash (/) commands with Discord.
+    # Guild-specific sync shows up instantly - good for testing.
+    # Global sync (no guild) can take up to an hour to propagate everywhere.
+    try:
+        if DEV_GUILD_ID:
+            guild = discord.Object(id=DEV_GUILD_ID)
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(synced)} slash command(s) to guild {DEV_GUILD_ID}")
+        else:
+            synced = await bot.tree.sync()
+            print(f"Synced {len(synced)} slash command(s) globally")
+    except Exception as e:
+        print(f"Slash command sync failed: {e}")
+
 
 # ---- Server join/leave messages ----
 @bot.event
@@ -91,23 +111,50 @@ async def on_member_remove(member):
         print(f"[welcome] Could not find channel with ID {WELCOME_CHANNEL_ID}")
 
 
-# Example command so you know it's alive - try "!ping" in your server
+# ---- Prefix commands (e.g. -ping) ----
+
+# Example command so you know it's alive - try "-ping" in your server
 @bot.command()
 async def ping(ctx):
     await ctx.send("cunt")
 
 
-# Roast command - usage: !roast @someone
+# Roast command - usage: -roast @someone
 @bot.command()
 async def roast(ctx, member: discord.Member = None):
     member = member or ctx.author  # roast yourself if no one is tagged
     await ctx.typing()
+    roast_text = await generate_roast(member.display_name)
+    await ctx.send(f"{member.mention} {roast_text}")
 
+
+# ---- Slash commands (e.g. /ping) ----
+# These are what show up in Discord's "/" menu. They require the bot to be
+# invited with the "applications.commands" scope (not just "bot"), and for
+# bot.tree.sync() to have run at least once (handled in on_ready above).
+
+@bot.tree.command(name="ping", description="Check if the bot is alive")
+async def slash_ping(interaction: discord.Interaction):
+    await interaction.response.send_message("cunt")
+
+
+@bot.tree.command(name="roast", description="Roast someone (or yourself)")
+@discord.app_commands.describe(member="Who to roast (leave blank to roast yourself)")
+async def slash_roast(interaction: discord.Interaction, member: discord.Member = None):
+    member = member or interaction.user
+    await interaction.response.defer()  # roast takes a sec (API call), so defer first
+    roast_text = await generate_roast(member.display_name)
+    await interaction.followup.send(f"{member.mention} {roast_text}")
+
+
+async def generate_roast(display_name: str) -> str:
+    """Shared roast-generation logic used by both the prefix and slash commands."""
     prompt = (
-     f"Write a short, savage roast (1 sentence) for {member.display_name}. "
-f"Be extremely rude, mean, and brutal. Be creative, not traditional. Use curse words. Roast their fatass, ugly face, stupid personality, smell, laziness — go hard. "
-f"Make it funny and vicious. "
-f"Absolutely no race, ethnicity, sexuality, or homophobic shit."
+        f"Write a short, savage roast (1 sentence) for {display_name}. "
+        f"Be extremely rude, mean, and brutal. Be creative, not traditional. Use curse words. "
+        f"Roast their fatass, ugly face, stupid personality, smell, laziness — go hard. "
+        f"Make it funny and vicious. "
+        f"Absolutely no race, ethnicity, sexuality, or homophobic shit."
     )
 
     try:
@@ -125,11 +172,10 @@ f"Absolutely no race, ethnicity, sexuality, or homophobic shit."
             timeout=20,
         )
         response.raise_for_status()
-        roast_text = response.json()["choices"][0]["message"]["content"].strip()
-        await ctx.send(f"{member.mention} {roast_text}")
+        return response.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
         print(f"Roast command error: {e}")
-        await ctx.send("no sry ask daddy jay for help")
+        return "no sry ask daddy jay for help"
 
 
 # ---- Generic message sender ----
