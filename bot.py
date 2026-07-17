@@ -650,6 +650,93 @@ async def slash_startcountinground(interaction: discord.Interaction, channel: di
     ))
 
 
+# ---- Embed builder ----
+# /sendembed lets mods build and post a real embed (title, formatted
+# description, color, footer, optional image) through a pop-up form -
+# no JSON required. Compare to -send, which is for admins who DO want to
+# hand-write a raw JSON payload for more advanced/unusual embeds.
+
+class EmbedBuilderModal(discord.ui.Modal, title="Build an embed"):
+    embed_title = discord.ui.TextInput(
+        label="Title (optional)",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=256,
+    )
+    embed_description = discord.ui.TextInput(
+        label="Description",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=4000,
+        placeholder="Supports **bold**, *italic*, bullet points, emoji, mentions, etc.",
+    )
+    embed_color = discord.ui.TextInput(
+        label="Color (optional)",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=20,
+        placeholder="Hex like #f30d25, or a name like red, purple, gold...",
+    )
+    embed_footer = discord.ui.TextInput(
+        label="Footer text (optional)",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=2048,
+    )
+
+    def __init__(self, channel: discord.TextChannel, image: discord.Attachment = None):
+        super().__init__()
+        self.channel = channel
+        self.image = image
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        color = SYSTEM_EMBED_COLOR
+        if self.embed_color.value:
+            parsed = parse_color(self.embed_color.value)
+            if parsed is not None:
+                color = parsed
+
+        embed = discord.Embed(description=self.embed_description.value, color=color)
+        if self.embed_title.value:
+            embed.title = self.embed_title.value
+        if self.embed_footer.value:
+            embed.set_footer(text=self.embed_footer.value)
+
+        file = None
+        if self.image is not None:
+            try:
+                file = await self.image.to_file()
+                embed.set_image(url=f"attachment://{file.filename}")
+            except discord.HTTPException as e:
+                await interaction.followup.send(embed=system_embed(f"Couldn't attach the image: {e}"), ephemeral=True)
+                return
+
+        try:
+            if file:
+                await self.channel.send(embed=embed, file=file)
+            else:
+                await self.channel.send(embed=embed)
+        except discord.Forbidden:
+            await interaction.followup.send(embed=system_embed(f"I don't have permission to send messages in {self.channel.mention}."), ephemeral=True)
+            return
+        except discord.HTTPException as e:
+            await interaction.followup.send(embed=system_embed(f"Failed to send: {e}"), ephemeral=True)
+            return
+
+        await interaction.followup.send(embed=system_embed(f"Sent to {self.channel.mention}"), ephemeral=True)
+
+
+@bot.tree.command(name="sendembed", description="Build and send a custom embed to a channel, no JSON required")
+@app_commands.describe(channel="Channel to send the embed to", image="Optional image to include in the embed")
+async def slash_sendembed(interaction: discord.Interaction, channel: discord.TextChannel, image: discord.Attachment = None):
+    if not await moderator_check(interaction):
+        return
+
+    await interaction.response.send_modal(EmbedBuilderModal(channel=channel, image=image))
+
+
 # ---- Prefix commands (e.g. -ping) ----
 
 # Example command so you know it's alive - try "-ping" in your server
