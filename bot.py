@@ -41,7 +41,7 @@ ADMIN_IDS = [925226542571855943]  # replace with your actual Discord user ID
 # Discord role ID allowed to use moderation commands (/kick, /ban, /warn,
 # /ground, /modlogs). Right-click the role in Server Settings -> Roles
 # (with Developer Mode on) -> Copy Role ID.
-MOD_ROLE_ID = 1515690428974891089  # replace with your actual moderator role ID
+MOD_ROLE_ID = 123456789012345678  # replace with your actual moderator role ID
 
 # Set this to your server's ID for instant slash-command syncing during
 # testing (guild syncs are instant; global syncs can take up to an hour
@@ -55,11 +55,18 @@ mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI) if MONGODB_UR
 db = mongo_client["olgabot"] if mongo_client else None
 settings_collection = db["greet_leave_settings"] if db is not None else None
 mod_actions_collection = db["mod_actions"] if db is not None else None
+counting_collection = db["counting_channels"] if db is not None else None
 
 # In-memory cache of per-guild messages/colors, loaded from MongoDB on
 # startup and kept in sync whenever /setgreetmsg or /setleavemsg is used.
 # Structure: { guild_id: {"greet": "...", "greet_color": int, "leave": "...", "leave_color": int} }
 guild_messages = {}
+
+# In-memory cache of active counting-game channels, loaded from MongoDB on
+# startup and kept in sync on every count. Keyed by channel ID (globally
+# unique), so multiple channels/guilds can each run their own round.
+# Structure: { channel_id: {"guild_id": int, "count": int, "last_user_id": int|None, "double_count_allowed": bool} }
+counting_state = {}
 
 # ---- Keep-alive web server ----
 # Render needs an open port to consider the service "alive", and a free
@@ -407,7 +414,7 @@ async def slash_kick(interaction: discord.Interaction, member: discord.Member, r
 
     # DM before kicking - once they're removed, the bot may no longer
     # share a server with them and the DM could fail to send.
-    await send_punishment_dm(member, f"Pfftth, you were kicked from **{interaction.guild.name}**: {reason}. Don't misbehave again or we may have to get the belt out pfftth.", interaction.user)
+    await send_punishment_dm(member, f"You were kicked from **{interaction.guild.name}**: {reason}", interaction.user)
 
     try:
         await member.kick(reason=f"{reason} (by {interaction.user})")
@@ -419,7 +426,7 @@ async def slash_kick(interaction: discord.Interaction, member: discord.Member, r
         return
 
     await log_mod_action(interaction.guild.id, member.id, "kick", reason, interaction.user.id)
-    await interaction.response.send_message(embed=system_embed(f"👢 Kicked {member.mention}: {reason}"))
+    await interaction.response.send_message(embed=system_embed(f"👢 Kicked {member.mention} - {reason}"))
 
 
 @bot.tree.command(name="ban", description="Ban a member from the server")
@@ -430,7 +437,7 @@ async def slash_ban(interaction: discord.Interaction, member: discord.Member, re
 
     # DM before banning - once they're removed, the bot may no longer
     # share a server with them and the DM could fail to send.
-    await send_punishment_dm(member, f"Pfftth, you were banned in **{interaction.guild.name}**: {reason}. Don't misbehave again or we may have to get the belt out pfftth.", interaction.user)
+    await send_punishment_dm(member, f"You were banned from **{interaction.guild.name}**: {reason}", interaction.user)
 
     try:
         await member.ban(reason=f"{reason} (by {interaction.user})", delete_message_seconds=delete_message_days * 86400)
@@ -452,8 +459,8 @@ async def slash_warn(interaction: discord.Interaction, member: discord.Member, r
         return
 
     await log_mod_action(interaction.guild.id, member.id, "warn", reason, interaction.user.id)
-    await interaction.response.send_message(embed=system_embed(f"Warned {member.mention}: {reason}"))
-    await send_punishment_dm(member, f"Pfftth, you were warned in **{interaction.guild.name}**: {reason}. Don't misbehave again or we may have to get the belt out pfftth", interaction.user)
+    await interaction.response.send_message(embed=system_embed(f"⚠️ Warned {member.mention} - {reason}"))
+    await send_punishment_dm(member, f"You were warned in **{interaction.guild.name}**: {reason}", interaction.user)
 
 
 @bot.tree.command(name="ground", description="Timeout (ground) a member for a set number of minutes")
@@ -504,6 +511,143 @@ async def slash_modlogs(interaction: discord.Interaction, member: discord.Member
             embed.add_field(name=field_name, value=field_value, inline=False)
 
     await interaction.response.send_message(embed=embed)
+
+
+# ---- Counting game ----
+# /startcountinground turns a channel into a counting game: people count up
+# 1, 2, 3... one message at a time. Say the wrong number, say something
+# that isn't a number, or (unless double counting is allowed) count twice
+# in a row, and the round resets to 1.
+
+COUNTING_RUIN_COLOR = discord.Color(15928613)
+
+
+async def load_counting_state():
+    """Load all active counting channels from MongoDB on startup, so a
+    round's progress survives restarts/redeploys."""
+    global counting_state
+    if counting_collection is None:
+        print("[counting] MONGODB_URI not set, skipping load (using in-memory only)")
+        return
+    try:
+        async for doc in counting_collection.find({}):
+            counting_state[doc["_id"]] = {
+                "guild_id": doc["guild_id"],
+                "count": doc.get("count", 0),
+                "last_user_id": doc.get("last_user_id"),
+                "double_count_allowed": doc.get("double_count_allowed", False),
+            }
+        print(f"[counting] Loaded {len(counting_state)} active counting channel(s)")
+    except Exception as e:
+        print(f"[counting] Failed to load state from MongoDB: {type(e).__name__}: {e}")
+
+
+async def save_counting_state(channel_id: int):
+    """Persist a single counting channel's current state to MongoDB."""
+    state = counting_state.get(channel_id)
+    if state is None or counting_collection is None:
+        return
+    try:
+        await counting_collection.update_one(
+            {"_id": channel_id},
+            {"$set": {
+                "guild_id": state["guild_id"],
+                "count": state["count"],
+                "last_user_id": state["last_user_id"],
+                "double_count_allowed": state["double_count_allowed"],
+            }},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[counting] Failed to save state for channel {channel_id}: {type(e).__name__}: {e}")
+
+
+async def ruin_counting(message: discord.Message, state: dict, attempted_number: int, reason: str):
+    """Reset a counting round to 1 and post the ruin embed."""
+    embed = discord.Embed(
+        description=(
+            f"Pfftth, stupid Olga {message.author.mention} ruined the counting at {attempted_number} for {reason}. "
+            f"Start from 1 again\n\n"
+            f"-Grabs belt-\n-Whips nonstop-\n-Disowns this stupid Olga-\n-Sends to SizzleBurger camp-"
+        ),
+        color=COUNTING_RUIN_COLOR,
+    )
+    state["count"] = 0
+    state["last_user_id"] = None
+    await save_counting_state(message.channel.id)
+    await message.channel.send(embed=embed)
+
+
+async def handle_counting_message(message: discord.Message):
+    state = counting_state.get(message.channel.id)
+    if state is None:
+        return
+
+    content = message.content.strip()
+    expected = state["count"] + 1
+
+    try:
+        number = int(content)
+    except ValueError:
+        await ruin_counting(message, state, expected, "typing something that wasn't a number")
+        return
+
+    if not state["double_count_allowed"] and state["last_user_id"] is not None and state["last_user_id"] == message.author.id:
+        await ruin_counting(message, state, expected, "counting twice in a row")
+        return
+
+    if number != expected:
+        await ruin_counting(message, state, expected, f"saying {number} instead of {expected}")
+        return
+
+    state["count"] = number
+    state["last_user_id"] = message.author.id
+    await save_counting_state(message.channel.id)
+    try:
+        await message.add_reaction("☑️")
+    except discord.HTTPException:
+        pass
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Always let prefix commands (-ping, -roast, -send) keep working -
+    # overriding on_message replaces discord.py's default handling of them.
+    if message.author.bot:
+        return
+
+    if (
+        message.guild is not None
+        and message.channel.id in counting_state
+        and not message.content.startswith(bot.command_prefix)
+    ):
+        await handle_counting_message(message)
+
+    await bot.process_commands(message)
+
+
+@bot.tree.command(name="startcountinground", description="Start (or restart) a counting game in a channel")
+@app_commands.describe(
+    channel="Channel where counting will happen",
+    double_count_allowed="Allow the same person to count twice in a row (default: no)",
+    start_at="The last correct number already counted (e.g. carrying over from another bot). Default: 0, so counting begins at 1",
+)
+async def slash_startcountinground(interaction: discord.Interaction, channel: discord.TextChannel, double_count_allowed: bool = False, start_at: app_commands.Range[int, 0, None] = 0):
+    if not await moderator_check(interaction):
+        return
+
+    counting_state[channel.id] = {
+        "guild_id": interaction.guild.id,
+        "count": start_at,
+        "last_user_id": None,
+        "double_count_allowed": double_count_allowed,
+    }
+    await save_counting_state(channel.id)
+
+    await interaction.response.send_message(embed=system_embed(
+        f"🔢 Counting round started in {channel.mention}. Next number: **{start_at + 1}**.\n"
+        f"Double counting: {'allowed' if double_count_allowed else 'not allowed'}."
+    ))
 
 
 # ---- Prefix commands (e.g. -ping) ----
@@ -666,5 +810,6 @@ keep_alive()
 @bot.event
 async def setup_hook():
     await load_guild_messages()
+    await load_counting_state()
 
 bot.run(TOKEN)
