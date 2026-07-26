@@ -939,18 +939,39 @@ async def check_new_wordle_puzzle():
 
     today_str = today_wordle_date_str()
     meta_doc = await wordle_meta_collection.find_one({"_id": "puzzle_announce"})
-    if meta_doc and meta_doc.get("last_announced_date") == today_str:
-        return  # already announced today's puzzle
+    last_seen = meta_doc.get("last_seen_date") if meta_doc else None
 
+    if last_seen == today_str:
+        return  # already handled today, nothing to do
+
+    if last_seen is None:
+        # First time this check has EVER run (e.g. right after deploying
+        # this feature, or the bot's very first startup) - just record
+        # today as the baseline without announcing. Otherwise every fresh
+        # deploy would immediately blast "today's Wordle is ready" even if
+        # that day's puzzle has already been out for hours.
+        try:
+            await wordle_meta_collection.update_one(
+                {"_id": "puzzle_announce"},
+                {"$set": {"last_seen_date": today_str}},
+                upsert=True,
+            )
+        except Exception as e:
+            print(f"[wordle] Failed to save puzzle-check baseline: {type(e).__name__}: {e}")
+        return
+
+    # last_seen holds a real previous date that doesn't match today - a
+    # genuine day rollover happened since our last check (or the bot was
+    # down across one and is catching up now), so announce it.
     word, date_str = await get_wordle_of_day()
     if word is None:
-        return  # fetch failed - try again next tick, don't mark as announced
+        return  # fetch failed - try again next tick, don't update last_seen yet
 
     channel = bot.get_channel(WORDLE_ANNOUNCE_CHANNEL_ID)
     if channel is not None:
         try:
             await channel.send(embed=discord.Embed(
-                description="🚬 -takes a smoke- -coughs until i pass out- YO YO YO HOESSSSS!!!!!!!! TODAYS WORDLE IS READY, GO PLAY NOW",
+                description="🚬 -takes a smoke- -coughs until i pass out- YO YO YO HOESSSSS!!!!!!!! TODAYS WORDLE IS READY, GO PLAY NOW. RUN /wordle",
                 color=SYSTEM_EMBED_COLOR,
             ))
         except discord.HTTPException as e:
@@ -959,7 +980,7 @@ async def check_new_wordle_puzzle():
     try:
         await wordle_meta_collection.update_one(
             {"_id": "puzzle_announce"},
-            {"$set": {"last_announced_date": date_str}},
+            {"$set": {"last_seen_date": date_str}},
             upsert=True,
         )
     except Exception as e:
@@ -1016,19 +1037,19 @@ async def evaluate_guild_wordle_streak(guild: discord.Guild):
     try:
         if had_win:
             await channel.send(embed=discord.Embed(
-                description=f"🔥 The server Wordle streak is now **{new_streak}**! Someone came through.",
+                description=f"🔥 wow, one of you actually turned on that fermented cobweb of a brain. the server Wordle streak is now **{new_streak}**",
                 color=discord.Color.green(),
             ))
         else:
             await channel.send(embed=discord.Embed(
-                description=f"💔 Nobody solved yesterday's Wordle - the server streak of **{old_streak}** has been lost.",
+                description=f"💔 Stupid hoes, nobody solved yesterday's Wordle, the server streak of **{old_streak}** has been lost",
                 color=discord.Color.red(),
             ))
     except discord.HTTPException as e:
         print(f"[wordle] Failed to post streak update: {type(e).__name__}: {e}")
 
 
-@tasks.loop(minutes=10)
+@tasks.loop(time=datetime.time(hour=0, minute=1, tzinfo=WORDLE_RESET_TIMEZONE))
 async def wordle_streak_loop():
     await check_new_wordle_puzzle()
     for guild in bot.guilds:
