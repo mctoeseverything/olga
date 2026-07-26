@@ -6,6 +6,7 @@ import threading
 import json
 import aiohttp
 import datetime
+from zoneinfo import ZoneInfo
 import motor.motor_asyncio
 from flask import Flask
 
@@ -73,8 +74,8 @@ counting_state = {}
 # Structure: { user_id: {"guild_id": int, "date": "YYYY-MM-DD", "word": str, "guesses": [{"word": str, "scores": [str,...]}]} }
 active_wordle_sessions = {}
 
-# Cache of today's Wordle answer, refetched once per UTC day so we're not
-# hitting NYT's API on every guess.
+# Cache of today's Wordle answer, refetched once per day (see
+# WORDLE_RESET_TIMEZONE below) so we're not hitting NYT's API on every guess.
 # Structure: {"date": "YYYY-MM-DD" | None, "word": str | None}
 wordle_word_cache = {"date": None, "word": None}
 
@@ -550,17 +551,27 @@ async def slash_stopcountinground(interaction: discord.Interaction, channel: dis
 WORDLE_MAX_GUESSES = 6
 WORDLE_TILE = {"green": "🟩", "yellow": "🟨", "gray": "⬛"}
 
+# The Wordle "day" resets when the clock hits midnight in THIS timezone -
+# not UTC. UTC was the original approach, but it rolls over mid-afternoon/
+# evening for US timezones, which caused the puzzle to appear to reset
+# hours before someone's actual local midnight (and then NOT reset again
+# at their real midnight, since the UTC date hadn't changed yet) - hence
+# the "you already played today" bug. Change this to whatever timezone
+# should govern the reset for your server. Full list of valid names:
+# https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+WORDLE_RESET_TIMEZONE = ZoneInfo("America/Chicago")
 
-def today_utc_str() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
+def today_wordle_date_str() -> str:
+    return datetime.datetime.now(WORDLE_RESET_TIMEZONE).date().isoformat()
 
 
 async def get_wordle_of_day():
-    """Fetch (and cache for the rest of the UTC day) today's real answer
-    from the NYT Wordle API. Returns (word, date_str), or (None, date_str)
-    if the fetch fails."""
+    """Fetch (and cache for the rest of the day in WORDLE_RESET_TIMEZONE)
+    today's real answer from the NYT Wordle API. Returns (word, date_str),
+    or (None, date_str) if the fetch fails."""
     global wordle_word_cache
-    date_str = today_utc_str()
+    date_str = today_wordle_date_str()
     if wordle_word_cache["date"] == date_str and wordle_word_cache["word"]:
         return wordle_word_cache["word"], date_str
 
