@@ -751,12 +751,12 @@ async def announce_wordle_result(user: discord.abc.User, session: dict, won: boo
 
     if won:
         embed = discord.Embed(
-            description=f"🎉 {user.mention} solved today's Wordle in **{guesses_used}/{WORDLE_MAX_GUESSES}**!",
+            description=f"🎉 look everyone, {user.mention} solved today's Wordle in **{guesses_used}/{WORDLE_MAX_GUESSES}**. good job cunt",
             color=discord.Color.green(),
         )
     else:
         embed = discord.Embed(
-            description=f"💀 {user.mention} failed today's Wordle. The word was **{session['word'].upper()}**.",
+            description=f"💀 Local KFC regular (and weight watchers subscriber) {user.mention} failed the Wordle, what a dumbass.",
             color=discord.Color.red(),
         )
 
@@ -1042,7 +1042,7 @@ async def evaluate_guild_wordle_streak(guild: discord.Guild):
             ))
         else:
             await channel.send(embed=discord.Embed(
-                description=f"💔 Stupid hoes, nobody solved yesterday's Wordle, the server streak of **{old_streak}** has been lost",
+                description=f"💔 stupid hoes, nobody solved yesterday's Wordle, the server streak of **{old_streak}** has been lost",
                 color=discord.Color.red(),
             ))
     except discord.HTTPException as e:
