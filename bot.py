@@ -716,7 +716,7 @@ async def handle_wordle_guess(message: discord.Message):
 
     guess = message.content.strip().lower()
     if len(guess) != 5 or not guess.isalpha():
-        await message.channel.send(embed=system_embed("Guesses need to be a single 5-letter word."))
+        await message.channel.send(embed=system_embed("-slaps in the back of the head- guesses need to be a single 5 letter word stupid hoe. do i need to explain it again??"))
         return
 
     scores = score_guess(guess, session["word"])
@@ -729,7 +729,7 @@ async def handle_wordle_guess(message: discord.Message):
 
     if won:
         embed = discord.Embed(
-            description=f"{board}\n\n🎉 **Got it in {len(session['guesses'])}/{WORDLE_MAX_GUESSES}!**",
+            description=f"{board}\n\n🎉 **good job hoe, u got it in {len(session['guesses'])}/{WORDLE_MAX_GUESSES}!**",
             color=discord.Color.green(),
         )
         await message.channel.send(embed=embed)
@@ -738,7 +738,7 @@ async def handle_wordle_guess(message: discord.Message):
 
     if out_of_guesses:
         embed = discord.Embed(
-            description=f"{board}\n\n💀 Out of guesses. The word was **{session['word'].upper()}**.",
+            description=f"{board}\n\n💀 stupid fatass bitch, you're a disappointment to this family. The word was **{session['word'].upper()}**.",
             color=discord.Color.red(),
         )
         await message.channel.send(embed=embed)
@@ -750,26 +750,26 @@ async def handle_wordle_guess(message: discord.Message):
     await message.channel.send(embed=embed)
 
 
-@bot.tree.command(name="wordle", description="Play today's real Wordle - I'll DM you the game")
+@bot.tree.command(name="wordle", description="play the wordle today, its pretty obivous")
 async def slash_wordle(interaction: discord.Interaction):
     if interaction.guild is None:
-        await interaction.response.send_message(embed=system_embed("Run this in a server - I'll DM you the game from there."), ephemeral=True)
+        await interaction.response.send_message(embed=system_embed("just run the command stupid hoe?? ill dm you it"), ephemeral=True)
         return
 
     if interaction.user.id in active_wordle_sessions:
-        await interaction.response.send_message(embed=system_embed("You've already got a Wordle game in progress - check your DMs!"), ephemeral=True)
+        await interaction.response.send_message(embed=system_embed("you already have a game going on in our dms, are you that stupid?"), ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
 
     word, date_str = await get_wordle_of_day()
     if word is None:
-        await interaction.followup.send(embed=system_embed("Couldn't fetch today's Wordle puzzle - try again in a bit."), ephemeral=True)
+        await interaction.followup.send(embed=system_embed("i couldnt get the wordle for today oops"), ephemeral=True)
         return
 
     stats_doc = await get_wordle_stats(interaction.guild.id, interaction.user.id)
     if stats_doc and stats_doc.get("last_played_date") == date_str:
-        await interaction.followup.send(embed=system_embed("You've already played today's Wordle here! Come back once the next puzzle drops."), ephemeral=True)
+        await interaction.followup.send(embed=system_embed("you already played the worlde today, dumbass. go get checked for alzheimers"), ephemeral=True)
         return
 
     active_wordle_sessions[interaction.user.id] = {
@@ -783,21 +783,21 @@ async def slash_wordle(interaction: discord.Interaction):
     try:
         await interaction.user.send(embed=discord.Embed(
             description=(
-                "🟩 **Wordle time!** Reply here with your guesses - one 5-letter word per message.\n"
-                f"You've got {WORDLE_MAX_GUESSES} tries. Good luck!"
+                "🟩 **wordle time** reply here with your guesses, one 5 letter word per message. is it that hard to understand hoe?\n"
+                f"you have {WORDLE_MAX_GUESSES} guesses. dont fuck it up"
             ),
             color=SYSTEM_EMBED_COLOR,
         ))
     except discord.HTTPException:
         del active_wordle_sessions[interaction.user.id]
         await delete_wordle_session(interaction.user.id)
-        await interaction.followup.send(embed=system_embed("I couldn't DM you - check that your DMs are open for this server and try again."), ephemeral=True)
+        await interaction.followup.send(embed=system_embed("your dms are off bitch, why though? youre not a celebrity, go turn those dms on hoe"), ephemeral=True)
         return
 
-    await interaction.followup.send(embed=system_embed("📬 Sent you a DM - go play!"), ephemeral=True)
+    await interaction.followup.send(embed=system_embed("go run to your dms for the game, bitch. that's the only running we'll ever see from you"), ephemeral=True)
 
 
-@bot.tree.command(name="wordlestats", description="View your (or someone else's) Wordle stats for this server")
+@bot.tree.command(name="wordlestats", description="check your (or someone else's if your nosy) Wordle stats")
 @app_commands.describe(member="Whose stats to view (default: yourself)")
 async def slash_wordlestats(interaction: discord.Interaction, member: discord.Member = None):
     if interaction.guild is None:
@@ -807,7 +807,7 @@ async def slash_wordlestats(interaction: discord.Interaction, member: discord.Me
     target = member or interaction.user
     doc = await get_wordle_stats(interaction.guild.id, target.id)
     if not doc:
-        await interaction.response.send_message(embed=system_embed(f"{target.display_name} hasn't played Wordle here yet."))
+        await interaction.response.send_message(embed=system_embed(f"{target.display_name} hasn't played Wordle here yet, wow, what a dumb bitch."))
         return
 
     games_played = doc.get("games_played", 0)
@@ -833,7 +833,7 @@ async def slash_wordlestats(interaction: discord.Interaction, member: discord.Me
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="wordleleaderboard", description="See the top Wordle players in this server")
+@bot.tree.command(name="wordleleaderboard", description="see the top Wordle players")
 async def slash_wordleleaderboard(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message(embed=system_embed("This command can only be used in a server."), ephemeral=True)
