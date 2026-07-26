@@ -98,6 +98,19 @@ async def on_ready():
         status=discord.Status.online
     )
 
+    # Wipe any leftover GLOBAL command registrations first. Since DEV_GUILD_ID
+    # is set below, this bot only ever syncs to that one guild - so any
+    # command that was ever registered globally in the past (e.g. during
+    # early testing) has no other code path to get cleared, and just sits
+    # there forever, showing up as a duplicate/stale entry in Discord's
+    # command picker. Doing this on every startup keeps that from happening.
+    try:
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
+        print("Cleared any stale global slash command(s)")
+    except Exception as e:
+        print(f"Failed to clear global slash commands: {e}")
+
     # Sync slash (/) commands with Discord.
     # Guild-specific sync shows up instantly - good for testing.
     # Global sync (no guild) can take up to an hour to propagate everywhere.
@@ -443,6 +456,11 @@ async def on_message(message: discord.Message):
     # Always let prefix commands (-ping, -send) keep working - overriding
     # on_message replaces discord.py's default handling of them.
     if message.author.bot:
+        return
+
+    if bot.user in message.mentions:
+        await message.channel.send("what the hell do you want bitch")
+        await bot.process_commands(message)
         return
 
     if (
