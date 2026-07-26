@@ -3,7 +3,6 @@ from discord.ext import commands
 from discord import app_commands
 import os
 import threading
-import requests
 import json
 import aiohttp
 import datetime
@@ -12,7 +11,6 @@ from flask import Flask
 
 # ---- Config ----
 TOKEN = os.getenv("DISCORD_TOKEN")  # set this as an environment variable, don't paste your token here
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # get this free from console.groq.com
 MONGODB_URI = os.getenv("MONGODB_URI")  # e.g. mongodb+srv://user:pass@cluster.mongodb.net
 STATUS_TEXT = "Olga Family: Season 4"  # change this to whatever you want
 
@@ -38,8 +36,8 @@ SYSTEM_EMBED_COLOR = discord.Color.from_str("#f30d25")
 # Right-click your name in Discord (with Developer Mode on) -> Copy User ID
 ADMIN_IDS = [925226542571855943]  # replace with your actual Discord user ID
 
-# Discord role ID allowed to use moderation commands (/kick, /ban, /warn,
-# /ground, /modlogs). Right-click the role in Server Settings -> Roles
+# Discord role ID allowed to use restricted commands (/startcountinground,
+# /stopcountinground). Right-click the role in Server Settings -> Roles
 # (with Developer Mode on) -> Copy Role ID.
 MOD_ROLE_ID = 1515690428974891089  # replace with your actual moderator role ID
 
@@ -54,7 +52,6 @@ DEV_GUILD_ID = 1469696264407879814  # e.g. 123456789012345678
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI) if MONGODB_URI else None
 db = mongo_client["olgabot"] if mongo_client else None
 settings_collection = db["greet_leave_settings"] if db is not None else None
-mod_actions_collection = db["mod_actions"] if db is not None else None
 counting_collection = db["counting_channels"] if db is not None else None
 
 # In-memory cache of per-guild messages/colors, loaded from MongoDB on
@@ -322,20 +319,10 @@ async def on_member_remove(member):
         print(f"[welcome] Could not find channel with ID {WELCOME_CHANNEL_ID}")
 
 
-# ---- Moderation ----
-# /kick, /ban, /warn, /ground (timeout), and /modlogs (history lookup).
-# Restricted to members holding the MOD_ROLE_ID role, configured above.
-
-MOD_ACTION_LABELS = {
-    "kick": "Kicked",
-    "ban": "Banned",
-    "warn": "Warned",
-    "ground": "Grounded",
-}
-
-# Discord's hard cap on timeouts is 28 days.
-MAX_GROUND_MINUTES = 40320
-
+# ---- Permission helpers ----
+# Shared by the restricted commands below (/startcountinground,
+# /stopcountinground). Restricted to members holding the MOD_ROLE_ID role,
+# configured above.
 
 def is_moderator(user) -> bool:
     if not isinstance(user, discord.Member):
@@ -343,43 +330,8 @@ def is_moderator(user) -> bool:
     return any(role.id == MOD_ROLE_ID for role in user.roles)
 
 
-async def log_mod_action(guild_id: int, target_id: int, action_type: str, reason: str, moderator_id: int, duration_minutes: int = None):
-    """Record a moderation action so it shows up in /modlogs."""
-    if mod_actions_collection is None:
-        print("[mod] MONGODB_URI not set, moderation action was not logged")
-        return
-    doc = {
-        "guild_id": guild_id,
-        "target_id": target_id,
-        "type": action_type,
-        "reason": reason,
-        "moderator_id": moderator_id,
-        "timestamp": datetime.datetime.now(datetime.timezone.utc),
-    }
-    if duration_minutes is not None:
-        doc["duration_minutes"] = duration_minutes
-    try:
-        await mod_actions_collection.insert_one(doc)
-    except Exception as e:
-        print(f"[mod] Failed to log {action_type} for user {target_id}: {type(e).__name__}: {e}")
-
-
-async def get_mod_history(guild_id: int, target_id: int, limit: int = 15):
-    """Return a user's past moderation actions in this guild, most recent first."""
-    if mod_actions_collection is None:
-        return []
-    try:
-        cursor = mod_actions_collection.find(
-            {"guild_id": guild_id, "target_id": target_id}
-        ).sort("timestamp", -1).limit(limit)
-        return await cursor.to_list(length=limit)
-    except Exception as e:
-        print(f"[mod] Failed to fetch history for user {target_id}: {type(e).__name__}: {e}")
-        return []
-
-
 async def moderator_check(interaction: discord.Interaction) -> bool:
-    """Shared guard for all moderation commands. Sends a denial reply and
+    """Shared guard for restricted commands. Sends a denial reply and
     returns False if the command shouldn't proceed."""
     if interaction.guild is None:
         await interaction.response.send_message(embed=system_embed("This command can only be used in a server."), ephemeral=True)
@@ -388,129 +340,6 @@ async def moderator_check(interaction: discord.Interaction) -> bool:
         await interaction.response.send_message(embed=system_embed("You're not allowed to use this command."), ephemeral=True)
         return False
     return True
-
-
-async def send_punishment_dm(member: discord.Member, description: str, moderator: discord.Member):
-    """DM the punished member with the action embed and a disabled gray
-    button crediting the moderator who did it. Silently does nothing if
-    their DMs are closed (or the bot no longer shares a server with them)."""
-    dm_view = discord.ui.View()
-    dm_view.add_item(discord.ui.Button(
-        label=f"Sent with hate from: {moderator.display_name}",
-        style=discord.ButtonStyle.gray,
-        disabled=True,
-    ))
-    try:
-        await member.send(embed=system_embed(description), view=dm_view)
-    except discord.HTTPException:
-        pass
-
-
-@bot.tree.command(name="kick", description="Kick a member from the server")
-@app_commands.describe(member="Who to kick", reason="Why they're being kicked")
-async def slash_kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
-    if not await moderator_check(interaction):
-        return
-
-    # DM before kicking - once they're removed, the bot may no longer
-    # share a server with them and the DM could fail to send.
-    await send_punishment_dm(member, f"You were kicked from **{interaction.guild.name}**: {reason}", interaction.user)
-
-    try:
-        await member.kick(reason=f"{reason} (by {interaction.user})")
-    except discord.Forbidden:
-        await interaction.response.send_message(embed=system_embed("I don't have permission to kick that member."), ephemeral=True)
-        return
-    except discord.HTTPException as e:
-        await interaction.response.send_message(embed=system_embed(f"Failed to kick: {e}"), ephemeral=True)
-        return
-
-    await log_mod_action(interaction.guild.id, member.id, "kick", reason, interaction.user.id)
-    await interaction.response.send_message(embed=system_embed(f"👢 Kicked {member.mention} - {reason}"))
-
-
-@bot.tree.command(name="ban", description="Ban a member from the server")
-@app_commands.describe(member="Who to ban", reason="Why they're being banned", delete_message_days="Days of their message history to delete (0-7, default 0)")
-async def slash_ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided", delete_message_days: app_commands.Range[int, 0, 7] = 0):
-    if not await moderator_check(interaction):
-        return
-
-    # DM before banning - once they're removed, the bot may no longer
-    # share a server with them and the DM could fail to send.
-    await send_punishment_dm(member, f"You were banned from **{interaction.guild.name}**: {reason}", interaction.user)
-
-    try:
-        await member.ban(reason=f"{reason} (by {interaction.user})", delete_message_seconds=delete_message_days * 86400)
-    except discord.Forbidden:
-        await interaction.response.send_message(embed=system_embed("I don't have permission to ban that member."), ephemeral=True)
-        return
-    except discord.HTTPException as e:
-        await interaction.response.send_message(embed=system_embed(f"Failed to ban: {e}"), ephemeral=True)
-        return
-
-    await log_mod_action(interaction.guild.id, member.id, "ban", reason, interaction.user.id)
-    await interaction.response.send_message(embed=system_embed(f"🔨 Banned {member.mention} - {reason}"))
-
-
-@bot.tree.command(name="warn", description="Log a warning against a member")
-@app_commands.describe(member="Who to warn", reason="What they're being warned for")
-async def slash_warn(interaction: discord.Interaction, member: discord.Member, reason: str):
-    if not await moderator_check(interaction):
-        return
-
-    await log_mod_action(interaction.guild.id, member.id, "warn", reason, interaction.user.id)
-    await interaction.response.send_message(embed=system_embed(f"⚠️ Warned {member.mention} - {reason}"))
-    await send_punishment_dm(member, f"You were warned in **{interaction.guild.name}**: {reason}", interaction.user)
-
-
-@bot.tree.command(name="ground", description="Timeout (ground) a member for a set number of minutes")
-@app_commands.describe(member="Who to ground", duration_minutes="How long to ground them for, in minutes", reason="Why they're being grounded")
-async def slash_ground(interaction: discord.Interaction, member: discord.Member, duration_minutes: app_commands.Range[int, 1, MAX_GROUND_MINUTES], reason: str = "No reason provided"):
-    if not await moderator_check(interaction):
-        return
-
-    until = discord.utils.utcnow() + datetime.timedelta(minutes=duration_minutes)
-    try:
-        await member.timeout(until, reason=f"{reason} (by {interaction.user})")
-    except discord.Forbidden:
-        await interaction.response.send_message(embed=system_embed("I don't have permission to ground that member."), ephemeral=True)
-        return
-    except discord.HTTPException as e:
-        await interaction.response.send_message(embed=system_embed(f"Failed to ground: {e}"), ephemeral=True)
-        return
-
-    await log_mod_action(interaction.guild.id, member.id, "ground", reason, interaction.user.id, duration_minutes=duration_minutes)
-    await interaction.response.send_message(embed=system_embed(f"🧎 Grounded {member.mention} for {duration_minutes} minute(s) - {reason}"))
-
-
-@bot.tree.command(name="modlogs", description="View a member's past moderation history")
-@app_commands.describe(member="Whose history to look up")
-async def slash_modlogs(interaction: discord.Interaction, member: discord.Member):
-    if not await moderator_check(interaction):
-        return
-
-    history = await get_mod_history(interaction.guild.id, member.id)
-
-    embed = discord.Embed(
-        title=f"Moderation history - {member.display_name}",
-        color=SYSTEM_EMBED_COLOR,
-    )
-    embed.set_thumbnail(url=member.display_avatar.url)
-
-    if not history:
-        embed.description = "No moderation actions on record."
-    else:
-        for entry in history:
-            label = MOD_ACTION_LABELS.get(entry["type"], entry["type"].title())
-            timestamp = entry["timestamp"]
-            unix_ts = int(timestamp.replace(tzinfo=datetime.timezone.utc).timestamp()) if timestamp.tzinfo is None else int(timestamp.timestamp())
-            field_name = f"{label} - <t:{unix_ts}:R>"
-            field_value = f"Reason: {entry.get('reason', 'No reason provided')}\nBy: <@{entry['moderator_id']}>"
-            if entry.get("duration_minutes") is not None:
-                field_value += f"\nDuration: {entry['duration_minutes']} minute(s)"
-            embed.add_field(name=field_name, value=field_value, inline=False)
-
-    await interaction.response.send_message(embed=embed)
 
 
 # ---- Counting game ----
@@ -611,8 +440,8 @@ async def handle_counting_message(message: discord.Message):
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Always let prefix commands (-ping, -roast, -send) keep working -
-    # overriding on_message replaces discord.py's default handling of them.
+    # Always let prefix commands (-ping, -send) keep working - overriding
+    # on_message replaces discord.py's default handling of them.
     if message.author.bot:
         return
 
@@ -650,91 +479,26 @@ async def slash_startcountinground(interaction: discord.Interaction, channel: di
     ))
 
 
-# ---- Embed builder ----
-# /sendembed lets mods build and post a real embed (title, formatted
-# description, color, footer, optional image) through a pop-up form -
-# no JSON required. Compare to -send, which is for admins who DO want to
-# hand-write a raw JSON payload for more advanced/unusual embeds.
-
-class EmbedBuilderModal(discord.ui.Modal, title="Build an embed"):
-    embed_title = discord.ui.TextInput(
-        label="Title (optional)",
-        style=discord.TextStyle.short,
-        required=False,
-        max_length=256,
-    )
-    embed_description = discord.ui.TextInput(
-        label="Description",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=4000,
-        placeholder="Supports **bold**, *italic*, bullet points, emoji, mentions, etc.",
-    )
-    embed_color = discord.ui.TextInput(
-        label="Color (optional)",
-        style=discord.TextStyle.short,
-        required=False,
-        max_length=20,
-        placeholder="Hex like #f30d25, or a name like red, purple, gold...",
-    )
-    embed_footer = discord.ui.TextInput(
-        label="Footer text (optional)",
-        style=discord.TextStyle.short,
-        required=False,
-        max_length=2048,
-    )
-
-    def __init__(self, channel: discord.TextChannel, image: discord.Attachment = None):
-        super().__init__()
-        self.channel = channel
-        self.image = image
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
-        color = SYSTEM_EMBED_COLOR
-        if self.embed_color.value:
-            parsed = parse_color(self.embed_color.value)
-            if parsed is not None:
-                color = parsed
-
-        embed = discord.Embed(description=self.embed_description.value, color=color)
-        if self.embed_title.value:
-            embed.title = self.embed_title.value
-        if self.embed_footer.value:
-            embed.set_footer(text=self.embed_footer.value)
-
-        file = None
-        if self.image is not None:
-            try:
-                file = await self.image.to_file()
-                embed.set_image(url=f"attachment://{file.filename}")
-            except discord.HTTPException as e:
-                await interaction.followup.send(embed=system_embed(f"Couldn't attach the image: {e}"), ephemeral=True)
-                return
-
-        try:
-            if file:
-                await self.channel.send(embed=embed, file=file)
-            else:
-                await self.channel.send(embed=embed)
-        except discord.Forbidden:
-            await interaction.followup.send(embed=system_embed(f"I don't have permission to send messages in {self.channel.mention}."), ephemeral=True)
-            return
-        except discord.HTTPException as e:
-            await interaction.followup.send(embed=system_embed(f"Failed to send: {e}"), ephemeral=True)
-            return
-
-        await interaction.followup.send(embed=system_embed(f"Sent to {self.channel.mention}"), ephemeral=True)
-
-
-@bot.tree.command(name="sendembed", description="Build and send a custom embed to a channel, no JSON required")
-@app_commands.describe(channel="Channel to send the embed to", image="Optional image to include in the embed")
-async def slash_sendembed(interaction: discord.Interaction, channel: discord.TextChannel, image: discord.Attachment = None):
+@bot.tree.command(name="stopcountinground", description="Stop the active counting game in a channel")
+@app_commands.describe(channel="Channel to stop counting in")
+async def slash_stopcountinground(interaction: discord.Interaction, channel: discord.TextChannel):
     if not await moderator_check(interaction):
         return
 
-    await interaction.response.send_modal(EmbedBuilderModal(channel=channel, image=image))
+    state = counting_state.pop(channel.id, None)
+    if state is None:
+        await interaction.response.send_message(embed=system_embed(f"There's no active counting round in {channel.mention}."), ephemeral=True)
+        return
+
+    if counting_collection is not None:
+        try:
+            await counting_collection.delete_one({"_id": channel.id})
+        except Exception as e:
+            print(f"[counting] Failed to delete state for channel {channel.id}: {type(e).__name__}: {e}")
+
+    await interaction.response.send_message(embed=system_embed(
+        f"🛑 Counting round stopped in {channel.mention}. Final count reached: **{state['count']}**."
+    ))
 
 
 # ---- Prefix commands (e.g. -ping) ----
@@ -745,15 +509,6 @@ async def ping(ctx):
     await ctx.send("cunt")
 
 
-# Roast command - usage: -roast @someone
-@bot.command()
-async def roast(ctx, member: discord.Member = None):
-    member = member or ctx.author  # roast yourself if no one is tagged
-    await ctx.typing()
-    roast_text = await generate_roast(member.display_name)
-    await ctx.send(f"{member.mention} {roast_text}")
-
-
 # ---- Slash commands (e.g. /ping) ----
 # These are what show up in Discord's "/" menu. They require the bot to be
 # invited with the "applications.commands" scope (not just "bot"), and for
@@ -762,46 +517,6 @@ async def roast(ctx, member: discord.Member = None):
 @bot.tree.command(name="ping", description="Check if the bot is alive")
 async def slash_ping(interaction: discord.Interaction):
     await interaction.response.send_message("cunt")
-
-
-@bot.tree.command(name="roast", description="Roast someone (or yourself)")
-@discord.app_commands.describe(member="Who to roast (leave blank to roast yourself)")
-async def slash_roast(interaction: discord.Interaction, member: discord.Member = None):
-    member = member or interaction.user
-    await interaction.response.defer()  # roast takes a sec (API call), so defer first
-    roast_text = await generate_roast(member.display_name)
-    await interaction.followup.send(f"{member.mention} {roast_text}")
-
-
-async def generate_roast(display_name: str) -> str:
-    """Shared roast-generation logic used by both the prefix and slash commands."""
-    prompt = (
-        f"Write a short, savage roast (1 sentence) for {display_name}. "
-        f"Be extremely rude, mean, and brutal. Be creative, not traditional. Use curse words. "
-        f"Roast their fatass, ugly face, stupid personality, smell, laziness — go hard. "
-        f"Make it funny and vicious. "
-        f"Absolutely no race, ethnicity, sexuality, or homophobic shit."
-    )
-
-    try:
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 150,
-            },
-            timeout=20,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"Roast command error: {e}")
-        return "no sry ask daddy jay for help"
 
 
 # ---- Generic message sender ----
