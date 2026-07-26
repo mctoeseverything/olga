@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import os
 import threading
@@ -42,6 +42,10 @@ ADMIN_IDS = [925226542571855943]  # replace with your actual Discord user ID
 # (with Developer Mode on) -> Copy Role ID.
 MOD_ROLE_ID = 1515690428974891089  # replace with your actual moderator role ID
 
+# Channel where Wordle game results (win/fail) and server-streak updates
+# get posted.
+WORDLE_ANNOUNCE_CHANNEL_ID = 1517175386021040138
+
 # Set this to your server's ID for instant slash-command syncing during
 # testing (guild syncs are instant; global syncs can take up to an hour
 # to show up everywhere). Leave as None to sync globally instead.
@@ -56,6 +60,9 @@ settings_collection = db["greet_leave_settings"] if db is not None else None
 counting_collection = db["counting_channels"] if db is not None else None
 wordle_sessions_collection = db["wordle_sessions"] if db is not None else None
 wordle_stats_collection = db["wordle_stats"] if db is not None else None
+wordle_daily_collection = db["wordle_daily_results"] if db is not None else None
+wordle_streak_collection = db["wordle_server_streak"] if db is not None else None
+wordle_meta_collection = db["wordle_meta"] if db is not None else None
 
 # In-memory cache of per-guild messages/colors, loaded from MongoDB on
 # startup and kept in sync whenever /setgreetmsg or /setleavemsg is used.
@@ -143,6 +150,9 @@ async def on_ready():
             print(f"Synced {len(synced)} slash command(s) globally")
     except Exception as e:
         print(f"Slash command sync failed: {e}")
+
+    if not wordle_streak_loop.is_running():
+        wordle_streak_loop.start()
 
 
 # ---- Greet/leave message settings ----
@@ -714,7 +724,51 @@ async def update_wordle_stats(guild_id: int, user_id: int, won: bool, guesses_us
         print(f"[wordle] Failed to update stats for user {user_id}: {type(e).__name__}: {e}")
 
 
+def wordle_daily_key(guild_id: int, date_str: str) -> str:
+    return f"{guild_id}:{date_str}"
+
+
+async def record_daily_win(guild_id: int, date_str: str):
+    """Mark that at least one person won in this guild on this date - the
+    server streak loop checks this to decide whether the streak continues."""
+    if wordle_daily_collection is None:
+        return
+    try:
+        await wordle_daily_collection.update_one(
+            {"_id": wordle_daily_key(guild_id, date_str)},
+            {"$set": {"guild_id": guild_id, "date": date_str}, "$inc": {"win_count": 1}},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[wordle] Failed to record daily win for guild {guild_id}: {type(e).__name__}: {e}")
+
+
+async def announce_wordle_result(user: discord.abc.User, session: dict, won: bool, guesses_used: int):
+    """Post a win/fail announcement to WORDLE_ANNOUNCE_CHANNEL_ID."""
+    channel = bot.get_channel(WORDLE_ANNOUNCE_CHANNEL_ID)
+    if channel is None:
+        return
+
+    if won:
+        embed = discord.Embed(
+            description=f"🎉 {user.mention} solved today's Wordle in **{guesses_used}/{WORDLE_MAX_GUESSES}**!",
+            color=discord.Color.green(),
+        )
+    else:
+        embed = discord.Embed(
+            description=f"💀 {user.mention} failed today's Wordle. The word was **{session['word'].upper()}**.",
+            color=discord.Color.red(),
+        )
+
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException as e:
+        print(f"[wordle] Failed to post result announcement: {type(e).__name__}: {e}")
+
+
 async def finish_wordle_game(user_id: int, session: dict, won: bool):
+    if won:
+        await record_daily_win(session["guild_id"], session["date"])
     await update_wordle_stats(session["guild_id"], user_id, won, len(session["guesses"]), session["date"])
     active_wordle_sessions.pop(user_id, None)
     await delete_wordle_session(user_id)
@@ -744,6 +798,7 @@ async def handle_wordle_guess(message: discord.Message):
             color=discord.Color.green(),
         )
         await message.channel.send(embed=embed)
+        await announce_wordle_result(message.author, session, won=True, guesses_used=len(session["guesses"]))
         await finish_wordle_game(message.author.id, session, won=True)
         return
 
@@ -753,6 +808,7 @@ async def handle_wordle_guess(message: discord.Message):
             color=discord.Color.red(),
         )
         await message.channel.send(embed=embed)
+        await announce_wordle_result(message.author, session, won=False, guesses_used=len(session["guesses"]))
         await finish_wordle_game(message.author.id, session, won=False)
         return
 
@@ -869,6 +925,119 @@ async def slash_wordleleaderboard(interaction: discord.Interaction):
 
     embed = discord.Embed(title="🏆 Wordle Leaderboard", description="\n".join(lines), color=SYSTEM_EMBED_COLOR)
     await interaction.response.send_message(embed=embed)
+
+
+# ---- Wordle new-puzzle announcement ----
+# Posts to WORDLE_ANNOUNCE_CHANNEL_ID as soon as a new day's puzzle becomes
+# available (checked on the same periodic loop as the streak evaluation,
+# below). Also pre-warms the word cache so the first /wordle of the day
+# doesn't have to wait on the NYT fetch.
+
+async def check_new_wordle_puzzle():
+    if wordle_meta_collection is None:
+        return
+
+    today_str = today_wordle_date_str()
+    meta_doc = await wordle_meta_collection.find_one({"_id": "puzzle_announce"})
+    if meta_doc and meta_doc.get("last_announced_date") == today_str:
+        return  # already announced today's puzzle
+
+    word, date_str = await get_wordle_of_day()
+    if word is None:
+        return  # fetch failed - try again next tick, don't mark as announced
+
+    channel = bot.get_channel(WORDLE_ANNOUNCE_CHANNEL_ID)
+    if channel is not None:
+        try:
+            await channel.send(embed=discord.Embed(
+                description="🚬 -takes a smoke- -coughs until i pass out- YO YO YO HOESSSSS!!!!!!!! TODAYS WORDLE IS READY, GO PLAY NOW",
+                color=SYSTEM_EMBED_COLOR,
+            ))
+        except discord.HTTPException as e:
+            print(f"[wordle] Failed to post new puzzle announcement: {type(e).__name__}: {e}")
+
+    try:
+        await wordle_meta_collection.update_one(
+            {"_id": "puzzle_announce"},
+            {"$set": {"last_announced_date": date_str}},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[wordle] Failed to save puzzle announcement marker: {type(e).__name__}: {e}")
+
+
+# ---- Wordle server streak ----
+# The server streak goes up by 1 for each day AT LEAST ONE person in the
+# server wins that day's Wordle. If a day passes with nobody playing, or
+# nobody who played got it right, the streak resets to 0. Checked once per
+# day (see wordle_streak_loop below) rather than the instant someone wins,
+# since we can't know a day was a total loss until it's actually over.
+
+def wordle_date_str_add(date_str: str, days: int) -> str:
+    return (datetime.date.fromisoformat(date_str) + datetime.timedelta(days=days)).isoformat()
+
+
+async def evaluate_guild_wordle_streak(guild: discord.Guild):
+    if wordle_streak_collection is None:
+        return
+
+    today_str = today_wordle_date_str()
+    yesterday_str = wordle_date_str_add(today_str, -1)
+
+    streak_doc = await wordle_streak_collection.find_one({"_id": guild.id})
+    if streak_doc and streak_doc.get("last_evaluated_date") == yesterday_str:
+        return  # already evaluated for this day rollover
+
+    old_streak = streak_doc.get("streak", 0) if streak_doc else 0
+
+    daily_doc = None
+    if wordle_daily_collection is not None:
+        daily_doc = await wordle_daily_collection.find_one({"_id": wordle_daily_key(guild.id, yesterday_str)})
+    had_win = bool(daily_doc and daily_doc.get("win_count", 0) > 0)
+
+    new_streak = old_streak + 1 if had_win else 0
+
+    try:
+        await wordle_streak_collection.update_one(
+            {"_id": guild.id},
+            {"$set": {"guild_id": guild.id, "streak": new_streak, "last_evaluated_date": yesterday_str}},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[wordle] Failed to update server streak for guild {guild.id}: {type(e).__name__}: {e}")
+
+    if new_streak == old_streak:
+        return  # nothing changed (e.g. brand new server, no one's played yet) - stay quiet
+
+    channel = bot.get_channel(WORDLE_ANNOUNCE_CHANNEL_ID)
+    if channel is None:
+        return
+
+    try:
+        if had_win:
+            await channel.send(embed=discord.Embed(
+                description=f"🔥 The server Wordle streak is now **{new_streak}**! Someone came through.",
+                color=discord.Color.green(),
+            ))
+        else:
+            await channel.send(embed=discord.Embed(
+                description=f"💔 Nobody solved yesterday's Wordle - the server streak of **{old_streak}** has been lost.",
+                color=discord.Color.red(),
+            ))
+    except discord.HTTPException as e:
+        print(f"[wordle] Failed to post streak update: {type(e).__name__}: {e}")
+
+
+@tasks.loop(minutes=10)
+async def wordle_streak_loop():
+    await check_new_wordle_puzzle()
+    for guild in bot.guilds:
+        await evaluate_guild_wordle_streak(guild)
+
+
+@wordle_streak_loop.before_loop
+async def before_wordle_streak_loop():
+    await bot.wait_until_ready()
 
 
 # ---- Prefix commands (e.g. -ping) ----
