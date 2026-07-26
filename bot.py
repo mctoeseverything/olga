@@ -98,15 +98,19 @@ async def on_ready():
         status=discord.Status.online
     )
 
-    # Wipe any leftover GLOBAL command registrations first. Since DEV_GUILD_ID
-    # is set below, this bot only ever syncs to that one guild - so any
-    # command that was ever registered globally in the past (e.g. during
-    # early testing) has no other code path to get cleared, and just sits
-    # there forever, showing up as a duplicate/stale entry in Discord's
-    # command picker. Doing this on every startup keeps that from happening.
+    # Wipe any leftover GLOBAL command registrations on Discord's side first.
+    # Since DEV_GUILD_ID is set below, this bot only ever syncs to that one
+    # guild - so any command that was ever registered globally in the past
+    # (e.g. during early testing) has no other code path to get cleared, and
+    # just sits there forever, showing up as a duplicate/stale entry in
+    # Discord's command picker. This uses a raw API call (bulk-overwriting
+    # Discord's global list with an empty one) instead of
+    # bot.tree.clear_commands(), because clear_commands() would also wipe
+    # our LOCAL command definitions below (they're registered without a
+    # guild, i.e. as "global" in the tree) - which would leave nothing for
+    # copy_global_to() to copy into the guild afterward.
     try:
-        bot.tree.clear_commands(guild=None)
-        await bot.tree.sync()
+        await bot.http.bulk_upsert_global_commands(bot.application_id, [])
         print("Cleared any stale global slash command(s)")
     except Exception as e:
         print(f"Failed to clear global slash commands: {e}")
