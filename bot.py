@@ -47,12 +47,14 @@ MOD_ROLE_ID = 1515690428974891089  # replace with your actual moderator role ID
 DEV_GUILD_ID = 1469696264407879814  # e.g. 123456789012345678
 
 # ---- MongoDB setup ----
-# Used to persist per-guild greet/leave messages and moderation history
-# across restarts/redeploys.
+# Used to persist per-guild greet/leave messages, counting rounds, and
+# Wordle sessions/stats across restarts/redeploys.
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI) if MONGODB_URI else None
 db = mongo_client["olgabot"] if mongo_client else None
 settings_collection = db["greet_leave_settings"] if db is not None else None
 counting_collection = db["counting_channels"] if db is not None else None
+wordle_sessions_collection = db["wordle_sessions"] if db is not None else None
+wordle_stats_collection = db["wordle_stats"] if db is not None else None
 
 # In-memory cache of per-guild messages/colors, loaded from MongoDB on
 # startup and kept in sync whenever /setgreetmsg or /setleavemsg is used.
@@ -64,6 +66,17 @@ guild_messages = {}
 # unique), so multiple channels/guilds can each run their own round.
 # Structure: { channel_id: {"guild_id": int, "count": int, "last_user_id": int|None, "double_count_allowed": bool} }
 counting_state = {}
+
+# In-memory cache of active (in-progress) Wordle games, loaded from MongoDB
+# on startup so a game someone's mid-way through survives a restart. Keyed
+# by user ID (one active game per person across all servers).
+# Structure: { user_id: {"guild_id": int, "date": "YYYY-MM-DD", "word": str, "guesses": [{"word": str, "scores": [str,...]}]} }
+active_wordle_sessions = {}
+
+# Cache of today's Wordle answer, refetched once per UTC day so we're not
+# hitting NYT's API on every guess.
+# Structure: {"date": "YYYY-MM-DD" | None, "word": str | None}
+wordle_word_cache = {"date": None, "word": None}
 
 # ---- Keep-alive web server ----
 # Render needs an open port to consider the service "alive", and a free
@@ -462,6 +475,12 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    if message.guild is None:
+        if message.author.id in active_wordle_sessions:
+            await handle_wordle_guess(message)
+        await bot.process_commands(message)
+        return
+
     if bot.user in message.mentions:
         await message.channel.send("what the hell do you want bitch")
         await bot.process_commands(message)
@@ -521,6 +540,324 @@ async def slash_stopcountinground(interaction: discord.Interaction, channel: dis
     await interaction.response.send_message(embed=system_embed(
         f"🛑 Counting round stopped in {channel.mention}. Final count reached: **{state['count']}**."
     ))
+
+
+# ---- Wordle ----
+# /wordle DMs the person that day's real NYT Wordle puzzle to play, one
+# guess per DM. /wordlestats and /wordleleaderboard read back the streaks
+# and stats tracked in MongoDB.
+
+WORDLE_MAX_GUESSES = 6
+WORDLE_TILE = {"green": "🟩", "yellow": "🟨", "gray": "⬛"}
+
+
+def today_utc_str() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
+
+async def get_wordle_of_day():
+    """Fetch (and cache for the rest of the UTC day) today's real answer
+    from the NYT Wordle API. Returns (word, date_str), or (None, date_str)
+    if the fetch fails."""
+    global wordle_word_cache
+    date_str = today_utc_str()
+    if wordle_word_cache["date"] == date_str and wordle_word_cache["word"]:
+        return wordle_word_cache["word"], date_str
+
+    url = f"https://www.nytimes.com/svc/wordle/v2/{date_str}.json"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    print(f"[wordle] Fetching puzzle failed: HTTP {resp.status}")
+                    return None, date_str
+                data = await resp.json()
+    except Exception as e:
+        print(f"[wordle] Failed to fetch puzzle: {type(e).__name__}: {e}")
+        return None, date_str
+
+    word = data.get("solution")
+    if not word:
+        return None, date_str
+    word = word.lower()
+    wordle_word_cache = {"date": date_str, "word": word}
+    return word, date_str
+
+
+def score_guess(guess: str, target: str):
+    """Score a guess against the target the way real Wordle does, including
+    correct handling of repeated letters. Returns a list of 5 strings, each
+    'green', 'yellow', or 'gray'."""
+    result = [None] * 5
+    remaining = list(target)
+
+    for i in range(5):
+        if guess[i] == target[i]:
+            result[i] = "green"
+            remaining[i] = None
+
+    for i in range(5):
+        if result[i] is not None:
+            continue
+        if guess[i] in remaining:
+            result[i] = "yellow"
+            remaining[remaining.index(guess[i])] = None
+        else:
+            result[i] = "gray"
+
+    return result
+
+
+def render_wordle_board(guesses) -> str:
+    rows = []
+    for g in guesses:
+        tiles = "".join(WORDLE_TILE[s] for s in g["scores"])
+        letters = " ".join(c.upper() for c in g["word"])
+        rows.append(f"{tiles}\n{letters}")
+    return "\n\n".join(rows)
+
+
+async def load_wordle_sessions():
+    """Load any in-progress Wordle games from MongoDB on startup, so a game
+    someone's mid-way through survives a restart/redeploy."""
+    global active_wordle_sessions
+    if wordle_sessions_collection is None:
+        print("[wordle] MONGODB_URI not set, skipping session load (using in-memory only)")
+        return
+    try:
+        async for doc in wordle_sessions_collection.find({}):
+            active_wordle_sessions[doc["_id"]] = {
+                "guild_id": doc["guild_id"],
+                "date": doc["date"],
+                "word": doc["word"],
+                "guesses": doc.get("guesses", []),
+            }
+        print(f"[wordle] Loaded {len(active_wordle_sessions)} active session(s)")
+    except Exception as e:
+        print(f"[wordle] Failed to load sessions from MongoDB: {type(e).__name__}: {e}")
+
+
+async def save_wordle_session(user_id: int):
+    session = active_wordle_sessions.get(user_id)
+    if session is None or wordle_sessions_collection is None:
+        return
+    try:
+        await wordle_sessions_collection.update_one({"_id": user_id}, {"$set": session}, upsert=True)
+    except Exception as e:
+        print(f"[wordle] Failed to save session for user {user_id}: {type(e).__name__}: {e}")
+
+
+async def delete_wordle_session(user_id: int):
+    if wordle_sessions_collection is not None:
+        try:
+            await wordle_sessions_collection.delete_one({"_id": user_id})
+        except Exception as e:
+            print(f"[wordle] Failed to delete session for user {user_id}: {type(e).__name__}: {e}")
+
+
+def wordle_stats_key(guild_id: int, user_id: int) -> str:
+    return f"{guild_id}:{user_id}"
+
+
+async def get_wordle_stats(guild_id: int, user_id: int):
+    if wordle_stats_collection is None:
+        return None
+    return await wordle_stats_collection.find_one({"_id": wordle_stats_key(guild_id, user_id)})
+
+
+async def update_wordle_stats(guild_id: int, user_id: int, won: bool, guesses_used: int, date_str: str):
+    """Record the result of a finished game: games played, wins, current/max
+    streak, and the guess-count distribution (for wins only, like real
+    Wordle's stats screen)."""
+    if wordle_stats_collection is None:
+        return
+
+    key = wordle_stats_key(guild_id, user_id)
+    doc = await wordle_stats_collection.find_one({"_id": key}) or {}
+
+    games_played = doc.get("games_played", 0) + 1
+    wins = doc.get("wins", 0) + (1 if won else 0)
+    current_streak = doc.get("current_streak", 0) + 1 if won else 0
+    max_streak = max(doc.get("max_streak", 0), current_streak)
+
+    distribution = doc.get("distribution", {})
+    if won:
+        distribution[str(guesses_used)] = distribution.get(str(guesses_used), 0) + 1
+
+    try:
+        await wordle_stats_collection.update_one(
+            {"_id": key},
+            {"$set": {
+                "guild_id": guild_id,
+                "user_id": user_id,
+                "games_played": games_played,
+                "wins": wins,
+                "current_streak": current_streak,
+                "max_streak": max_streak,
+                "distribution": distribution,
+                "last_played_date": date_str,
+            }},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[wordle] Failed to update stats for user {user_id}: {type(e).__name__}: {e}")
+
+
+async def finish_wordle_game(user_id: int, session: dict, won: bool):
+    await update_wordle_stats(session["guild_id"], user_id, won, len(session["guesses"]), session["date"])
+    active_wordle_sessions.pop(user_id, None)
+    await delete_wordle_session(user_id)
+
+
+async def handle_wordle_guess(message: discord.Message):
+    session = active_wordle_sessions.get(message.author.id)
+    if session is None:
+        return
+
+    guess = message.content.strip().lower()
+    if len(guess) != 5 or not guess.isalpha():
+        await message.channel.send(embed=system_embed("Guesses need to be a single 5-letter word."))
+        return
+
+    scores = score_guess(guess, session["word"])
+    session["guesses"].append({"word": guess, "scores": scores})
+    await save_wordle_session(message.author.id)
+
+    board = render_wordle_board(session["guesses"])
+    won = guess == session["word"]
+    out_of_guesses = len(session["guesses"]) >= WORDLE_MAX_GUESSES
+
+    if won:
+        embed = discord.Embed(
+            description=f"{board}\n\n🎉 **Got it in {len(session['guesses'])}/{WORDLE_MAX_GUESSES}!**",
+            color=discord.Color.green(),
+        )
+        await message.channel.send(embed=embed)
+        await finish_wordle_game(message.author.id, session, won=True)
+        return
+
+    if out_of_guesses:
+        embed = discord.Embed(
+            description=f"{board}\n\n💀 Out of guesses. The word was **{session['word'].upper()}**.",
+            color=discord.Color.red(),
+        )
+        await message.channel.send(embed=embed)
+        await finish_wordle_game(message.author.id, session, won=False)
+        return
+
+    guesses_left = WORDLE_MAX_GUESSES - len(session["guesses"])
+    embed = discord.Embed(description=f"{board}\n\nGuesses left: {guesses_left}", color=SYSTEM_EMBED_COLOR)
+    await message.channel.send(embed=embed)
+
+
+@bot.tree.command(name="wordle", description="Play today's real Wordle - I'll DM you the game")
+async def slash_wordle(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(embed=system_embed("Run this in a server - I'll DM you the game from there."), ephemeral=True)
+        return
+
+    if interaction.user.id in active_wordle_sessions:
+        await interaction.response.send_message(embed=system_embed("You've already got a Wordle game in progress - check your DMs!"), ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    word, date_str = await get_wordle_of_day()
+    if word is None:
+        await interaction.followup.send(embed=system_embed("Couldn't fetch today's Wordle puzzle - try again in a bit."), ephemeral=True)
+        return
+
+    stats_doc = await get_wordle_stats(interaction.guild.id, interaction.user.id)
+    if stats_doc and stats_doc.get("last_played_date") == date_str:
+        await interaction.followup.send(embed=system_embed("You've already played today's Wordle here! Come back once the next puzzle drops."), ephemeral=True)
+        return
+
+    active_wordle_sessions[interaction.user.id] = {
+        "guild_id": interaction.guild.id,
+        "date": date_str,
+        "word": word,
+        "guesses": [],
+    }
+    await save_wordle_session(interaction.user.id)
+
+    try:
+        await interaction.user.send(embed=discord.Embed(
+            description=(
+                "🟩 **Wordle time!** Reply here with your guesses - one 5-letter word per message.\n"
+                f"You've got {WORDLE_MAX_GUESSES} tries. Good luck!"
+            ),
+            color=SYSTEM_EMBED_COLOR,
+        ))
+    except discord.HTTPException:
+        del active_wordle_sessions[interaction.user.id]
+        await delete_wordle_session(interaction.user.id)
+        await interaction.followup.send(embed=system_embed("I couldn't DM you - check that your DMs are open for this server and try again."), ephemeral=True)
+        return
+
+    await interaction.followup.send(embed=system_embed("📬 Sent you a DM - go play!"), ephemeral=True)
+
+
+@bot.tree.command(name="wordlestats", description="View your (or someone else's) Wordle stats for this server")
+@app_commands.describe(member="Whose stats to view (default: yourself)")
+async def slash_wordlestats(interaction: discord.Interaction, member: discord.Member = None):
+    if interaction.guild is None:
+        await interaction.response.send_message(embed=system_embed("This command can only be used in a server."), ephemeral=True)
+        return
+
+    target = member or interaction.user
+    doc = await get_wordle_stats(interaction.guild.id, target.id)
+    if not doc:
+        await interaction.response.send_message(embed=system_embed(f"{target.display_name} hasn't played Wordle here yet."))
+        return
+
+    games_played = doc.get("games_played", 0)
+    wins = doc.get("wins", 0)
+    win_pct = round(wins / games_played * 100) if games_played else 0
+    distribution = doc.get("distribution", {})
+    max_count = max((int(v) for v in distribution.values()), default=0)
+
+    dist_lines = []
+    for i in range(1, WORDLE_MAX_GUESSES + 1):
+        count = int(distribution.get(str(i), 0))
+        bar_len = round((count / max_count) * 10) if max_count else 0
+        bar = "🟩" * bar_len if bar_len else "▫️"
+        dist_lines.append(f"`{i}` {bar} {count}")
+
+    embed = discord.Embed(title=f"Wordle stats - {target.display_name}", color=SYSTEM_EMBED_COLOR)
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="Games played", value=str(games_played))
+    embed.add_field(name="Win %", value=f"{win_pct}%")
+    embed.add_field(name="Current streak", value=f"🔥 {doc.get('current_streak', 0)}")
+    embed.add_field(name="Max streak", value=str(doc.get("max_streak", 0)))
+    embed.add_field(name="Guess distribution", value="\n".join(dist_lines), inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="wordleleaderboard", description="See the top Wordle players in this server")
+async def slash_wordleleaderboard(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(embed=system_embed("This command can only be used in a server."), ephemeral=True)
+        return
+
+    if wordle_stats_collection is None:
+        await interaction.response.send_message(embed=system_embed("The leaderboard isn't available (no database configured)."), ephemeral=True)
+        return
+
+    cursor = wordle_stats_collection.find({"guild_id": interaction.guild.id}).sort(
+        [("current_streak", -1), ("wins", -1)]
+    ).limit(10)
+    docs = await cursor.to_list(length=10)
+
+    if not docs:
+        await interaction.response.send_message(embed=system_embed("No one has played Wordle here yet."))
+        return
+
+    lines = []
+    for i, doc in enumerate(docs, start=1):
+        lines.append(f"**{i}.** <@{doc['user_id']}> - 🔥 {doc.get('current_streak', 0)} streak, {doc.get('wins', 0)} wins")
+
+    embed = discord.Embed(title="🏆 Wordle Leaderboard", description="\n".join(lines), color=SYSTEM_EMBED_COLOR)
+    await interaction.response.send_message(embed=embed)
 
 
 # ---- Prefix commands (e.g. -ping) ----
@@ -635,5 +972,6 @@ keep_alive()
 async def setup_hook():
     await load_guild_messages()
     await load_counting_state()
+    await load_wordle_sessions()
 
 bot.run(TOKEN)
